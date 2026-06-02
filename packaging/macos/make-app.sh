@@ -127,5 +127,17 @@ hdiutil create -volname "Claude Buddy" -srcfolder "$STAGE" \
   -ov -format UDZO "$DMG" >/dev/null
 rm -rf "$STAGE"
 
+# Sign the .dmg container itself (the app inside is already signed). Without
+# this the notarization ticket still staples, but `spctl -a -t open` reports
+# "no usable signature" because the dmg carries none — so we sign it (with a
+# secure timestamp) whenever a real identity is present. Canonical order is
+# sign-app -> build-dmg -> sign-dmg -> notarize -> staple (notarize/staple run
+# in CI after this script).
+if [ "$IDENTITY" != "-" ]; then
+  echo "==> codesigning dmg"
+  codesign --force --timestamp --sign "$IDENTITY" "$DMG"
+  codesign --verify --verbose=2 "$DMG"
+fi
+
 echo "==> done: $APP"
 echo "==> done: $DMG"
