@@ -1,0 +1,1504 @@
+//! The long-running daemon: owns the BLE link, serves hook IPC, aggregates
+//! session state, and drives the heartbeat + permission loop.
+//!
+//! Design: a single owner task holds all mutable state. Everything else
+//! (IPC accept loop, BLE notification pump, timers) feeds it [`Event`]s over
+//! an mpsc channel, so there are no locks around the state.
+
+use crate::ble::BleLink;
+use crate::ipc::{
+    AdminRequest, AdminResponse, DeviceCommand, Endpoint, HookEvent, HookRequest, HookResponse,
+    Query, QueryRequest, QueryResponse, StatusReport, UpdateStatus, ENDPOINT_FILE,
+};
+use crate::protocol::{
+    self, Decision, Heartbeat, Inbound, OutboundCmd, PromptPayload, TimeSync, MAX_LINE_BYTES,
+};
+use crate::state::{config_dir, Config, SessionState};
+use anyhow::{Context, Result};
+use serde::Serialize;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, oneshot};
+use tracing::{debug, error, info, warn};
+
+/// The thing the owner loop sends heartbeats/commands to. Normally a real BLE
+/// buddy; in `--mock-device` mode a virtual device that auto-answers prompts,
+/// so the whole hook→daemon→decision loop runs with no hardware.
+#[derive(Clone)]
+enum Link {
+    Ble(BleLink),
+    Mock(MockLink),
+}
+
+impl Link {
+    async fn send<T: Serialize>(&self, v: &T) -> Result<()> {
+        let line = protocol::to_line(v)?;
+        match self {
+            Link::Ble(l) => l.write_line(&line).await,
+            Link::Mock(m) => m.send_line(&line).await,
+        }
+    }
+    async fn disconnect(&self) {
+        match self {
+            Link::Ble(l) => l.disconnect().await,
+            Link::Mock(_) => {}
+        }
+    }
+    /// Is the underlying transport still up? Polled each keepalive so a
+    /// vanished buddy is noticed promptly instead of only when a write fails.
+    async fn is_connected(&self) -> bool {
+        match self {
+            Link::Ble(l) => l.is_connected().await,
+            Link::Mock(_) => true,
+        }
+    }
+}
+
+/// What the mock device decides on each prompt.
+#[derive(Clone, Copy)]
+pub enum MockPolicy {
+    Approve,
+    Deny,
+}
+
+impl MockPolicy {
+    pub fn from_str(s: &str) -> MockPolicy {
+        match s.to_ascii_lowercase().as_str() {
+            "deny" => MockPolicy::Deny,
+            _ => MockPolicy::Approve,
+        }
+    }
+    fn decision(&self) -> &'static str {
+        match self {
+            MockPolicy::Approve => "once",
+            MockPolicy::Deny => "deny",
+        }
+    }
+}
+
+/// A virtual buddy. It "displays" each heartbeat (logged) and, when a prompt
+/// arrives, injects a permission decision back into the event loop after a
+/// short delay — simulating a user tapping the screen.
+#[derive(Clone)]
+struct MockLink {
+    ev_tx: mpsc::Sender<Event>,
+    policy: MockPolicy,
+    /// Last prompt id answered, so repeated heartbeats don't re-answer.
+    answered: Arc<Mutex<Option<String>>>,
+}
+
+impl MockLink {
+    async fn send_line(&self, bytes: &[u8]) -> Result<()> {
+        let line = String::from_utf8_lossy(bytes);
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            return Ok(());
+        };
+        if let Some(msg) = v.get("msg").and_then(|m| m.as_str()) {
+            debug!("[mock-device] screen: {msg}");
+        }
+        if let Some(prompt) = v.get("prompt") {
+            if let Some(id) = prompt.get("id").and_then(|i| i.as_str()) {
+                let mut answered = self.answered.lock().unwrap();
+                if answered.as_deref() == Some(id) {
+                    return Ok(()); // already answered this prompt
+                }
+                *answered = Some(id.to_string());
+                drop(answered);
+                let decision = self.policy.decision();
+                let tool = prompt.get("tool").and_then(|t| t.as_str()).unwrap_or("");
+                let hint = prompt.get("hint").and_then(|h| h.as_str()).unwrap_or("");
+                info!("[mock-device] prompt: {tool} ({hint}) → auto-{decision}");
+                let ev_tx = self.ev_tx.clone();
+                let id = id.to_string();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(800)).await;
+                    let line = format!(
+                        "{{\"cmd\":\"permission\",\"id\":\"{id}\",\"decision\":\"{decision}\"}}"
+                    );
+                    let _ = ev_tx.send(Event::DeviceLine(line)).await;
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// How long the device may sit on a prompt before we give up. Kept *under* the
+/// hook's own deadline (hook::PRETOOL_TIMEOUT, 25s) so the daemon resolves the
+/// waiting hook with a Defer through the live channel — and clears the device
+/// screen — *before* the hook times out on its own. (If this were larger than
+/// the hook timeout, the hook would defer while the device still showed a live
+/// prompt whose tap would resolve a dead channel.)
+const PROMPT_TTL: Duration = Duration::from_secs(20);
+/// Keepalive cadence. The firmware treats >30s of silence as a dead link.
+const KEEPALIVE: Duration = Duration::from_secs(3);
+/// Max gap between inbound device lines before we treat the link as stalled and
+/// force a reconnect. The firmware sends a liveness pong every ~3s, so silence
+/// this long means the link wedged (e.g. a macOS CoreBluetooth disconnect that
+/// never closes the notify stream) — the only reliable signal, since `is_connected`
+/// reports a stale `true` and a fire-and-forget write still returns `Ok`.
+const LIVENESS_TIMEOUT: Duration = Duration::from_secs(6);
+/// Scan window per reconnect attempt.
+const SCAN_SECS: u64 = 12;
+/// How long to wait for the device's `{"ack":"wifi"}` (verified NVS persistence)
+/// before telling the user the buddy didn't confirm. Generous: the firmware
+/// writes NVS and may briefly attempt to join before acking.
+const WIFI_ACK_TIMEOUT: Duration = Duration::from_secs(8);
+/// After a wifi ack with ok:true, how long to keep waiting for a
+/// `{"net":connected}` so we can report "joined <ssid>" instead of just
+/// "stored". Short — if the join is slow we report the (already successful)
+/// store rather than make the user wait.
+const WIFI_JOIN_GRACE: Duration = Duration::from_secs(6);
+/// How often to re-check GitHub for a newer app release. Long: a desktop-app
+/// update is never urgent, and unauthenticated GitHub API calls are rate-limited
+/// (60/hr/IP) — six hours keeps us far clear while still noticing a release
+/// within a day. The first check runs shortly after startup (see the checker).
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+
+/// Messages into the owner task.
+enum Event {
+    /// A hook process connected and sent an event; reply via the oneshot.
+    Hook(HookEvent, oneshot::Sender<HookResponse>),
+    /// A CLI client asked to push a command at the device; reply via the oneshot.
+    DeviceCommand(DeviceCommand, oneshot::Sender<AdminResponse>),
+    /// A UI client asked for a read-only snapshot; reply via the oneshot.
+    Query(Query, oneshot::Sender<QueryResponse>),
+    /// A reassembled line arrived from the device.
+    DeviceLine(String),
+    /// Link came up (BLE or mock).
+    Connected(Link),
+    /// A connect attempt failed; carries a user-facing classified reason so the
+    /// status UI can guide the user (Bluetooth off, buddy asleep, etc.).
+    ConnectError(String),
+    /// Link went down.
+    Disconnected,
+    /// Periodic keepalive heartbeat.
+    Keepalive,
+    /// A pending prompt outlived its TTL.
+    PromptTimeout(String),
+    /// The background update checker found the latest release (or refreshed it).
+    UpdateInfo(UpdateStatus),
+}
+
+/// A Wi-Fi provisioning request whose IPC responder is parked until the device
+/// confirms (or fails) storing the credentials. We do NOT reply to the CLI/app
+/// at write time — only `{"ack":"wifi","ok":...}` (verified NVS persistence in
+/// the firmware) resolves it, so "Ok" genuinely means *persisted*.
+struct PendingWifi {
+    responder: oneshot::Sender<AdminResponse>,
+    /// Phase of the correlation: waiting for the store ack, or (after a good
+    /// ack) briefly waiting for a join announcement to enrich the reply.
+    phase: WifiPhase,
+    /// When the current phase must resolve by, even if nothing more arrives.
+    deadline: std::time::Instant,
+}
+
+enum WifiPhase {
+    /// Awaiting `{"ack":"wifi",...}`. Timeout → "did not confirm".
+    AwaitingAck,
+    /// Got a good ack; awaiting `{"net":connected}` to say "joined <ssid>".
+    /// Timeout → resolve Ok with no join info ("stored, not joined yet").
+    AwaitingJoin,
+}
+
+/// A permission prompt awaiting a device decision.
+struct Pending {
+    id: String,
+    tool: String,
+    hint: String,
+    /// Claude's permission mode for this call; relabels the device buttons.
+    mode: String,
+    session: String,
+    responder: oneshot::Sender<HookResponse>,
+}
+
+pub async fn run(mock: Option<MockPolicy>) -> Result<()> {
+    // --- Single-instance guard. ---
+    // A BLE peripheral accepts ONE central at a time and stops advertising while
+    // connected, so two daemons fight over the buddy's single link: the loser
+    // silently sees nothing and the device looks dead until it's power-cycled.
+    // Take an exclusive advisory lock for the daemon's whole lifetime; a second
+    // instance can't acquire it and exits cleanly here. `_lock` must stay in
+    // scope — dropping it (or the process exiting) releases the lock.
+    let _lock = acquire_singleton_lock()?;
+
+    let mut config = Config::load()?;
+    let mut state = SessionState::from_config(&config);
+
+    // --- IPC endpoint: bind loopback, publish {port, token} for hooks. ---
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("binding IPC socket")?;
+    let port = listener.local_addr()?.port();
+    let token = uuid::Uuid::new_v4().to_string();
+    write_endpoint(&Endpoint {
+        port,
+        token: token.clone(),
+    })?;
+    info!("daemon IPC on 127.0.0.1:{port}");
+
+    let (ev_tx, mut ev_rx) = mpsc::channel::<Event>(256);
+
+    spawn_ipc_accept(listener, token, ev_tx.clone());
+    spawn_keepalive(ev_tx.clone());
+    spawn_update_checker(ev_tx.clone());
+
+    if let Some(policy) = mock {
+        // Virtual device: "connect" immediately, auto-answer prompts.
+        warn!(
+            "running with a MOCK DEVICE (auto-{}) — no BLE",
+            policy.decision()
+        );
+        let link = Link::Mock(MockLink {
+            ev_tx: ev_tx.clone(),
+            policy,
+            answered: Arc::new(Mutex::new(None)),
+        });
+        let _ = ev_tx.send(Event::Connected(link)).await;
+    } else {
+        spawn_ble_manager(config.preferred_device.clone(), ev_tx.clone());
+    }
+
+    let mut link: Option<Link> = None;
+    // Prompts not yet shown/answered. Front of the queue is the one on screen.
+    let mut prompts: VecDeque<Pending> = VecDeque::new();
+    // Last (ssid, ip, online) the device announced — surfaced to the status UI
+    // for OTA and the connectivity indicator. `online` is the device's internet
+    // reachability probe result (None until first reported). Cleared on drop.
+    let mut last_net: Option<(String, String, Option<bool>)> = None;
+    // An in-flight Wi-Fi provisioning request whose CLI/app responder is parked
+    // until the device acks storing the creds (and, briefly, joining). At most
+    // one at a time — the latest request supersedes any earlier unresolved one.
+    let mut pending_wifi: Option<PendingWifi> = None;
+    // The last classified reason a connect attempt failed, surfaced in status so
+    // the UI can guide the user. Cleared on a successful connect.
+    let mut last_connect_error: Option<String> = None;
+    // Firmware version the connected buddy announced (`{"fw":...}`). Tied to the
+    // live link — cleared on disconnect so we never show a stale version for a
+    // device that's gone (or, worse, for a different buddy that connects next).
+    let mut last_fw: Option<String> = None;
+    // Board id the connected buddy announced (`{"board":...}`), tied to the live
+    // link like last_fw — cleared on disconnect. Picks the OTA image per board.
+    let mut last_board: Option<String> = None;
+    // Latest release the background checker found, if any. Surfaced in status so
+    // the app can offer an update; refreshed every UPDATE_CHECK_INTERVAL.
+    let mut latest_update: Option<UpdateStatus> = None;
+
+    info!("owner: {}", config.owner);
+
+    loop {
+        // If a Wi-Fi request is parked, race its deadline against the next
+        // event so we can resolve it on time even when the device says nothing
+        // more. `sleep_until` on a far-future instant when nothing is pending.
+        let wifi_deadline = pending_wifi
+            .as_ref()
+            .map(|w| w.deadline)
+            .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(3600));
+        let ev = tokio::select! {
+            ev = ev_rx.recv() => match ev {
+                Some(ev) => ev,
+                None => break, // all senders dropped — shutting down
+            },
+            _ = tokio::time::sleep_until(wifi_deadline.into()), if pending_wifi.is_some() => {
+                resolve_wifi_deadline(&mut pending_wifi, last_net.as_ref());
+                continue;
+            }
+        };
+        match ev {
+            Event::Connected(l) => {
+                link = Some(l.clone());
+                last_connect_error = None;
+                on_connect(&l, &config).await;
+                push_heartbeat(&link, &state, prompts.front()).await;
+            }
+            Event::ConnectError(reason) => {
+                debug!("connect attempt failed: {reason}");
+                last_connect_error = Some(reason);
+            }
+            Event::Disconnected => {
+                warn!("device disconnected");
+                last_net = None;
+                last_fw = None;
+                last_board = None;
+                drop_link(&mut link, &mut prompts, &mut state);
+                // A parked Wi-Fi request can never be confirmed now — fail it
+                // rather than leave the CLI/app hanging until its own timeout.
+                if let Some(w) = pending_wifi.take() {
+                    let _ = w.responder.send(AdminResponse::Error {
+                        message: "the buddy disconnected before confirming Wi-Fi — try again"
+                            .into(),
+                    });
+                }
+            }
+            Event::Keepalive => {
+                if config_token_day_changed(&mut config, &mut state) {
+                    let _ = config.save();
+                }
+                // Proactively notice a vanished buddy: poll the live connection
+                // state rather than waiting for the notify stream to close or a
+                // heartbeat write to fail (both bounded by the BLE supervision
+                // timeout). The instant the link is gone we stop gating, so a
+                // powered-off or cased buddy never wedges tool calls on a screen
+                // nobody can reach.
+                // Bound the liveness poll: a wedged macOS CoreBluetooth handle
+                // can leave `is_connected()` hanging, and this runs *in* the
+                // single owner loop — an unbounded await here would freeze hook
+                // IPC and device decisions too. Treat timeout-or-false as gone,
+                // matching the 2s/3s wrappers on the send paths. Authoritative
+                // liveness still comes from the LIVENESS_TIMEOUT pong path in
+                // spawn_ble_manager; this is the proactive, bounded backstop.
+                let gone = match &link {
+                    Some(l) => !matches!(
+                        tokio::time::timeout(Duration::from_secs(2), l.is_connected()).await,
+                        Ok(true)
+                    ),
+                    None => false,
+                };
+                if gone {
+                    warn!("keepalive: buddy no longer connected — dropping link");
+                    last_net = None;
+                    last_fw = None;
+                    last_board = None;
+                    drop_link(&mut link, &mut prompts, &mut state);
+                }
+                push_heartbeat(&link, &state, prompts.front()).await;
+            }
+            Event::DeviceLine(line) => {
+                handle_device_line(
+                    &line,
+                    &mut prompts,
+                    &mut state,
+                    &mut last_net,
+                    &mut last_fw,
+                    &mut last_board,
+                    &mut pending_wifi,
+                );
+                // A decision may have cleared the front prompt — refresh.
+                push_heartbeat(&link, &state, prompts.front()).await;
+            }
+            Event::PromptTimeout(id) => {
+                if let Some(pos) = prompts.iter().position(|p| p.id == id) {
+                    let p = prompts.remove(pos).unwrap();
+                    state.set_waiting(&p.session, false);
+                    let _ = p.responder.send(HookResponse::Defer {
+                        reason: "device did not respond in time".into(),
+                    });
+                    push_heartbeat(&link, &state, prompts.front()).await;
+                }
+            }
+            Event::Hook(event, responder) => {
+                handle_hook(
+                    event,
+                    responder,
+                    &link,
+                    &mut state,
+                    &mut config,
+                    &mut prompts,
+                    &ev_tx,
+                )
+                .await;
+                push_heartbeat(&link, &state, prompts.front()).await;
+            }
+            Event::DeviceCommand(cmd, responder) => {
+                // Wi-Fi is correlated: we write the creds (bounded), then PARK
+                // the responder until the device acks storing them — we must
+                // NOT await the ack here, because this same owner loop processes
+                // the DeviceLine that carries it (awaiting would deadlock). A
+                // new request supersedes any earlier unresolved one.
+                match cmd {
+                    DeviceCommand::Wifi { ssid, pass } => {
+                        let Some(l) = &link else {
+                            let _ = responder.send(AdminResponse::NoDevice);
+                            continue;
+                        };
+                        let out = OutboundCmd::Wifi { ssid, pass };
+                        match tokio::time::timeout(Duration::from_secs(3), l.send(&out)).await {
+                            Ok(Ok(())) => {
+                                // Supersede any earlier unresolved request.
+                                if let Some(prev) = pending_wifi.take() {
+                                    let _ = prev.responder.send(AdminResponse::Error {
+                                        message: "superseded by a newer Wi-Fi request".into(),
+                                    });
+                                }
+                                pending_wifi = Some(PendingWifi {
+                                    responder,
+                                    phase: WifiPhase::AwaitingAck,
+                                    deadline: std::time::Instant::now() + WIFI_ACK_TIMEOUT,
+                                });
+                            }
+                            Ok(Err(e)) => {
+                                let _ = responder.send(AdminResponse::Error {
+                                    message: e.to_string(),
+                                });
+                            }
+                            Err(_) => {
+                                let _ = responder.send(AdminResponse::Error {
+                                    message: "device write timed out".into(),
+                                });
+                            }
+                        }
+                    }
+                    DeviceCommand::Ota => {
+                        // Fire-and-forget: tell the device to enter OTA mode.
+                        // It frees BLE+sprite and the link drops as a result, so
+                        // we don't wait for an ack on the link we're killing — a
+                        // successful write is the confirmation. The daemon then
+                        // sees the disconnect and scans until the device reboots
+                        // into the new image and re-advertises.
+                        let Some(l) = &link else {
+                            let _ = responder.send(AdminResponse::NoDevice);
+                            continue;
+                        };
+                        match tokio::time::timeout(
+                            Duration::from_secs(3),
+                            l.send(&OutboundCmd::Ota),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {
+                                info!("sent OTA-mode command; device will free heap for the flash");
+                                let _ = responder.send(AdminResponse::Ok { joined: None });
+                            }
+                            Ok(Err(e)) => {
+                                let _ = responder.send(AdminResponse::Error {
+                                    message: e.to_string(),
+                                });
+                            }
+                            Err(_) => {
+                                let _ = responder.send(AdminResponse::Error {
+                                    message: "device write timed out".into(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            Event::UpdateInfo(u) => {
+                if u.available {
+                    info!("update available: {} (current {})", u.latest, u.current);
+                }
+                latest_update = Some(u);
+            }
+            Event::Query(query, responder) => {
+                let resp = match query {
+                    Query::Status => QueryResponse::Status(build_status(
+                        &config,
+                        &state,
+                        link.is_some(),
+                        last_net.as_ref(),
+                        last_fw.as_deref(),
+                        last_board.as_deref(),
+                        last_connect_error.as_deref(),
+                        latest_update.as_ref(),
+                    )),
+                };
+                let _ = responder.send(resp);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Assemble the snapshot the desktop UI renders from the owner loop's state.
+#[allow(clippy::too_many_arguments)]
+fn build_status(
+    config: &Config,
+    state: &SessionState,
+    device_connected: bool,
+    last_net: Option<&(String, String, Option<bool>)>,
+    last_fw: Option<&str>,
+    last_board: Option<&str>,
+    last_connect_error: Option<&str>,
+    latest_update: Option<&UpdateStatus>,
+) -> StatusReport {
+    StatusReport {
+        device_connected,
+        owner: config.owner.clone(),
+        tokens_today: state.tokens_today,
+        tokens_total: state.tokens,
+        sessions_total: state.total(),
+        sessions_running: state.running(),
+        sessions_waiting: state.waiting(),
+        entries: state.entries().to_vec(),
+        device_ssid: last_net.map(|(s, _, _)| s.clone()),
+        device_ip: last_net.map(|(_, ip, _)| ip.clone()),
+        device_online: last_net.and_then(|(_, _, o)| *o),
+        device_fw: last_fw.map(str::to_string),
+        device_board: last_board.map(str::to_string),
+        update: latest_update.cloned(),
+        // Bluetooth availability/permission aren't directly observable from the
+        // owner loop (the adapter handle lives in the BLE manager). We infer
+        // from the latest connect error's classification instead: a clear
+        // "Bluetooth off / not permitted" reason sets these, otherwise unknown.
+        bluetooth_available: device_connected || !connect_error_is_bluetooth(last_connect_error),
+        bluetooth_permitted: connect_error_permission_hint(last_connect_error),
+        // Only meaningful while disconnected; a live link cleared it already.
+        last_connect_error: if device_connected {
+            None
+        } else {
+            last_connect_error.map(str::to_string)
+        },
+    }
+}
+
+/// Does the connect-error reason point at Bluetooth being off / unavailable
+/// (as opposed to "buddy not found / asleep")? Drives `bluetooth_available`.
+fn connect_error_is_bluetooth(reason: Option<&str>) -> bool {
+    let Some(r) = reason else { return false };
+    let r = r.to_ascii_lowercase();
+    r.contains("bluetooth") || r.contains("adapter") || r.contains("powered")
+}
+
+/// Best-effort permission hint from the connect-error text. `Some(false)` when
+/// the OS signalled an authorization problem; `None` when we can't tell.
+fn connect_error_permission_hint(reason: Option<&str>) -> Option<bool> {
+    let r = reason?.to_ascii_lowercase();
+    if r.contains("permit") || r.contains("unauthorized") || r.contains("not authorized") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// On a fresh connection, sync time + owner so the device clock and greeting
+/// are correct.
+async fn on_connect(link: &Link, config: &Config) {
+    let (epoch, offset, _today) = local_now();
+    let time = TimeSync {
+        time: (epoch, offset),
+    };
+    let send_time = tokio::time::timeout(Duration::from_secs(2), link.send(&time));
+    if let Ok(Err(e)) = send_time.await {
+        warn!("time sync failed: {e}");
+    }
+    let owner = OutboundCmd::Owner {
+        name: config.owner.clone(),
+    };
+    let send_owner = tokio::time::timeout(Duration::from_secs(2), link.send(&owner));
+    if let Ok(Err(e)) = send_owner.await {
+        warn!("owner sync failed: {e}");
+    }
+}
+
+/// Translate a hook event into state changes and (for PermissionRequest) a
+/// device prompt whose decision is relayed back to the hook.
+async fn handle_hook(
+    event: HookEvent,
+    responder: oneshot::Sender<HookResponse>,
+    link: &Option<Link>,
+    state: &mut SessionState,
+    config: &mut Config,
+    prompts: &mut VecDeque<Pending>,
+    ev_tx: &mpsc::Sender<Event>,
+) {
+    match event {
+        HookEvent::SessionStart { session_id, cwd } => {
+            state.session_started(&session_id);
+            state.set_cwd(&session_id, &cwd);
+            let _ = responder.send(HookResponse::Ack);
+        }
+        HookEvent::SessionEnd { session_id } => {
+            state.session_ended(&session_id);
+            let _ = responder.send(HookResponse::Ack);
+        }
+        HookEvent::UserPromptSubmit { session_id, cwd } => {
+            state.set_running(&session_id, true);
+            state.set_cwd(&session_id, &cwd);
+            let _ = responder.send(HookResponse::Ack);
+        }
+        HookEvent::Stop {
+            session_id,
+            session_total_tokens,
+            summary,
+            final_turn,
+            model,
+            ctx_tokens,
+            cwd,
+        } => {
+            let (epoch, _, today) = local_now();
+            // Fold in only the newly-seen tokens for this session (dedupes
+            // repeated Stop/SubagentStop for the same transcript) and refresh
+            // its per-session telemetry (model, context size, project).
+            state.record_turn(
+                &session_id,
+                session_total_tokens,
+                &model,
+                ctx_tokens,
+                &cwd,
+                &today,
+            );
+            state.sync_to_config(config);
+            let _ = config.save();
+            // Only a real Stop ends the turn. A subagent finishing leaves the
+            // parent session running.
+            if final_turn {
+                state.set_running(&session_id, false);
+                state.mark_completed(epoch + 5); // ~5s celebrate window
+            }
+            if let Some(s) = summary {
+                state.push_entry(s);
+            }
+            let _ = responder.send(HookResponse::Ack);
+        }
+        HookEvent::Telemetry {
+            session_id,
+            session_total_tokens,
+            model,
+            ctx_tokens,
+            cwd,
+        } => {
+            // Every PreToolUse fires this (gating moved to PermissionRequest):
+            // update the live readout only — no prompt, no running/waiting
+            // change, no config.save (Stop persists). Folds tokens via the same
+            // deduped path, so it can't double-count against the eventual Stop.
+            let (_, _, today) = local_now();
+            state.record_turn(
+                &session_id,
+                session_total_tokens,
+                &model,
+                ctx_tokens,
+                &cwd,
+                &today,
+            );
+            let _ = responder.send(HookResponse::Ack);
+        }
+        HookEvent::Notification {
+            session_id: _,
+            message,
+        } => {
+            // A notification (e.g. "needs your input") can fire mid-turn, so it
+            // must NOT flip the session to idle. Just surface the text.
+            if let Some(m) = message {
+                state.push_entry(m);
+            }
+            let _ = responder.send(HookResponse::Ack);
+        }
+        HookEvent::PermissionRequest {
+            session_id,
+            tool,
+            hint,
+            mode,
+            cwd,
+        } => {
+            // Claude only raises this when it would genuinely prompt, so reaching
+            // here means the real session is gating. Telemetry was already
+            // refreshed by the `Telemetry` event from the `PreToolUse` that
+            // precedes every prompt, so this arm only drives the device prompt.
+            // No device? Defer immediately so the user is never blocked.
+            if link.is_none() {
+                let _ = responder.send(HookResponse::Defer {
+                    reason: "no buddy connected".into(),
+                });
+                return;
+            }
+            let id = format!("req_{}", uuid::Uuid::new_v4().simple());
+            state.set_waiting(&session_id, true);
+            state.set_cwd(&session_id, &cwd);
+            state.push_entry(format!("approve: {tool}"));
+            prompts.push_back(Pending {
+                id: id.clone(),
+                tool,
+                hint,
+                mode,
+                session: session_id,
+                responder,
+            });
+            // Arm a TTL so a forgotten prompt can't wedge a session.
+            let ev_tx = ev_tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(PROMPT_TTL).await;
+                let _ = ev_tx.send(Event::PromptTimeout(id)).await;
+            });
+        }
+    }
+}
+
+/// Force the link down and release any waiting hooks with a Defer. Called both
+/// on an observed BLE disconnect and when a keepalive poll finds the link gone,
+/// so a powered-off / out-of-range buddy stops gating within a heartbeat
+/// instead of after the full BLE supervision timeout. Deferred (not denied) so
+/// the freed calls fall through to Claude Code's normal permission flow.
+fn drop_link(link: &mut Option<Link>, prompts: &mut VecDeque<Pending>, state: &mut SessionState) {
+    *link = None;
+    for p in prompts.drain(..) {
+        let _ = p.responder.send(HookResponse::Defer {
+            reason: "device disconnected".into(),
+        });
+        state.set_waiting(&p.session, false);
+    }
+}
+
+/// Parse one device line; resolve a matching pending prompt on a decision,
+/// correlate a Wi-Fi store ack/join with a parked provisioning request, and
+/// record any Wi-Fi the device announces joining (for the status UI / OTA).
+fn handle_device_line(
+    line: &str,
+    prompts: &mut VecDeque<Pending>,
+    state: &mut SessionState,
+    last_net: &mut Option<(String, String, Option<bool>)>,
+    last_fw: &mut Option<String>,
+    last_board: &mut Option<String>,
+    pending_wifi: &mut Option<PendingWifi>,
+) {
+    match protocol::parse_inbound(line) {
+        Ok(Inbound::Permission(d)) => {
+            if let Some(pos) = prompts.iter().position(|p| p.id == d.id) {
+                let p = prompts.remove(pos).unwrap();
+                state.set_waiting(&p.session, false);
+                let allow = d.decision == Decision::Once;
+                info!(
+                    "device {} {}",
+                    if allow { "approved" } else { "denied" },
+                    p.tool
+                );
+                let _ = p.responder.send(HookResponse::Decision { allow });
+            } else {
+                debug!("decision for unknown/expired prompt {}", d.id);
+            }
+        }
+        Ok(Inbound::Ack(a)) => {
+            if a.ack == "wifi" {
+                // Correlate with the parked provisioning request. The firmware's
+                // ok reflects *verified NVS persistence* (see firmware xfer.h /
+                // net.cpp), so only ok:true means the creds will survive a reboot.
+                if let Some(w) = pending_wifi.take() {
+                    if a.ok {
+                        info!("buddy confirmed storing Wi-Fi credentials");
+                        // Briefly wait for a join announcement to enrich the
+                        // reply, but the store is already confirmed-good.
+                        *pending_wifi = Some(PendingWifi {
+                            responder: w.responder,
+                            phase: WifiPhase::AwaitingJoin,
+                            deadline: std::time::Instant::now() + WIFI_JOIN_GRACE,
+                        });
+                    } else {
+                        let msg = a.error.clone().unwrap_or_else(|| {
+                            "the buddy could not store the Wi-Fi credentials".into()
+                        });
+                        warn!("buddy nacked wifi: {msg}");
+                        let _ = w.responder.send(AdminResponse::Error { message: msg });
+                    }
+                } else if !a.ok {
+                    warn!("device nacked wifi (no pending request): {:?}", a.error);
+                }
+            } else if !a.ok {
+                warn!("device nacked {}: {:?}", a.ack, a.error);
+            } else {
+                debug!("ack {}", a.ack);
+            }
+        }
+        Ok(Inbound::Other(v)) => {
+            // The device announces its WiFi address on connect (net.cpp). Surface
+            // it at info so the user can find the buddy for an OTA upload.
+            if let Some(net) = v.get("net") {
+                if net.get("connected") == Some(&true.into()) {
+                    let ip = net.get("ip").and_then(|s| s.as_str()).unwrap_or("?");
+                    let ssid = net.get("ssid").and_then(|s| s.as_str()).unwrap_or("?");
+                    // Internet reachability (vs merely associated). Absent on older
+                    // firmware → None (unknown), shown by the app as just "joined".
+                    let online = net.get("online").and_then(|b| b.as_bool());
+                    info!("buddy joined WiFi \"{ssid}\" at {ip} (internet: {}) — OTA: --upload-port {ip} (or buddy.local)",
+                          match online { Some(true) => "yes", Some(false) => "no", None => "?" });
+                    *last_net = Some((ssid.to_string(), ip.to_string(), online));
+                    // If a provisioning request is in its join-grace phase, resolve
+                    // it now with the richer "joined <ssid>" outcome.
+                    if matches!(
+                        pending_wifi.as_ref().map(|w| &w.phase),
+                        Some(WifiPhase::AwaitingJoin)
+                    ) {
+                        if let Some(w) = pending_wifi.take() {
+                            let _ = w.responder.send(AdminResponse::Ok {
+                                joined: Some(ssid.to_string()),
+                            });
+                        }
+                    }
+                } else if net.get("connected") == Some(&false.into()) {
+                    info!("buddy left WiFi; clearing OTA address");
+                    *last_net = None;
+                }
+            } else if let Some(fw) = v.get("fw").and_then(|f| f.as_str()) {
+                // The device announces its firmware version + board id on BLE
+                // connect (`{"fw":"v0.1.0","board":"cyd"}`). Record both so the
+                // app can compare the version against the image it bundles for
+                // that board and offer an OTA update. Log only on a change — the
+                // device re-announces a couple times per connect.
+                if last_fw.as_deref() != Some(fw) {
+                    info!("buddy firmware version: {fw}");
+                }
+                *last_fw = Some(fw.to_string());
+                // `board` rides the same announce; older firmware omits it.
+                if let Some(board) = v.get("board").and_then(|b| b.as_str()) {
+                    if last_board.as_deref() != Some(board) {
+                        info!("buddy board: {board}");
+                    }
+                    *last_board = Some(board.to_string());
+                }
+            } else {
+                debug!("device: {v}");
+            }
+        }
+        Err(e) => debug!("unparseable device line {line:?}: {e}"),
+    }
+}
+
+/// A parked Wi-Fi request hit its phase deadline with no further device word.
+/// In `AwaitingAck` the device never confirmed storing the creds → error. In
+/// `AwaitingJoin` the store already succeeded; we just didn't see a join in the
+/// grace window → report success (stored, join not yet observed).
+fn resolve_wifi_deadline(
+    pending_wifi: &mut Option<PendingWifi>,
+    last_net: Option<&(String, String, Option<bool>)>,
+) {
+    let Some(w) = pending_wifi.take() else { return };
+    match w.phase {
+        WifiPhase::AwaitingAck => {
+            warn!("buddy did not confirm storing Wi-Fi within the timeout");
+            let _ = w.responder.send(AdminResponse::Error {
+                message: "the buddy did not confirm storing Wi-Fi — try again".into(),
+            });
+        }
+        WifiPhase::AwaitingJoin => {
+            // Stored OK; surface a join only if we happen to already know one.
+            let joined = last_net.map(|(s, _, _)| s.clone());
+            let _ = w.responder.send(AdminResponse::Ok { joined });
+        }
+    }
+}
+
+/// Build and send a heartbeat reflecting current state and the on-screen
+/// prompt (front of the queue), if any. Returns false if the write failed so
+/// the caller can tear down a dead link.
+///
+/// Strings are truncated to the device's fixed buffer sizes (TamaState in the
+/// firmware: msg[24], lines[8][92], promptTool[20], promptHint[44]).
+async fn push_heartbeat(link: &Option<Link>, state: &SessionState, front: Option<&Pending>) {
+    let Some(link) = link else { return };
+
+    let prompt = front.map(|p| PromptPayload {
+        id: p.id.clone(),
+        tool: truncate(&p.tool, 19),
+        hint: truncate(&p.hint, 43),
+        // "default" carries no extra UI meaning; only send a non-default mode.
+        mode: if p.mode == "default" {
+            String::new()
+        } else {
+            p.mode.clone()
+        },
+        sid: SessionState::short_id_of(&p.session),
+    });
+
+    let msg = if let Some(p) = front {
+        format!("approve: {}", p.tool)
+    } else if state.running() > 0 {
+        state
+            .entries()
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "working…".into())
+    } else if state.total() > 0 {
+        "idle".into()
+    } else {
+        "zzz".into()
+    };
+
+    let entries: Vec<String> = state
+        .entries()
+        .iter()
+        .take(8)
+        .map(|e| truncate(e, 91))
+        .collect();
+
+    // Per-session detail for the device's session picker. cwd/model are already
+    // short, but truncate to the firmware's fixed buffers to be safe.
+    let sessions = state
+        .sessions_snapshot()
+        .into_iter()
+        .map(|mut s| {
+            s.cwd = truncate(&s.cwd, 15);
+            s.m = truncate(&s.m, 7);
+            s
+        })
+        .collect();
+
+    let now = local_now().0;
+    let mut hb = Heartbeat {
+        total: state.total(),
+        running: state.running(),
+        waiting: state.waiting(),
+        completed: state.recently_completed(now),
+        msg: truncate(&msg, 23),
+        entries,
+        tokens: state.tokens,
+        tokens_today: state.tokens_today,
+        sessions,
+        prompt,
+    };
+
+    // Hard byte budget. Per-field truncation bounds each string, but the
+    // *assembled* line can still overrun the firmware's fixed line buffer once
+    // many entries/sessions (especially multibyte) stack up — and the firmware
+    // drops an over-length line whole, so the entire heartbeat would silently
+    // vanish. Shed the largest variable contributors until we're under budget:
+    // entries first (the ticker degrades gracefully — fewer recent lines), then
+    // sessions. The prompt and counters are load-bearing and never shed.
+    enforce_line_budget(&mut hb);
+
+    // Bound the write so a hung BLE link can't stall the owner loop (which
+    // also services device decisions and hook IPC). On failure, force the link
+    // down so the BLE manager reconnects — otherwise a half-open link would
+    // leave hooks waiting and the device frozen.
+    match tokio::time::timeout(Duration::from_secs(2), link.send(&hb)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            warn!("heartbeat write failed: {e} — dropping link");
+            let link = link.clone();
+            tokio::spawn(async move { link.disconnect().await });
+        }
+        Err(_) => {
+            warn!("heartbeat write timed out — dropping link");
+            let link = link.clone();
+            tokio::spawn(async move { link.disconnect().await });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Background tasks
+// ---------------------------------------------------------------------------
+
+/// Accept hook connections; each sends one [`HookRequest`] line and reads one
+/// [`HookResponse`] line.
+fn spawn_ipc_accept(listener: TcpListener, token: String, ev_tx: mpsc::Sender<Event>) {
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let token = token.clone();
+                    let ev_tx = ev_tx.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = serve_hook_conn(stream, &token, &ev_tx).await {
+                            debug!("hook connection error: {e}");
+                        }
+                    });
+                }
+                Err(e) => {
+                    error!("IPC accept failed: {e}");
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+        }
+    });
+}
+
+async fn serve_hook_conn(
+    stream: TcpStream,
+    token: &str,
+    ev_tx: &mpsc::Sender<Event>,
+) -> Result<()> {
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    let mut line = String::new();
+    // Bound the read so a connected-but-silent client can't park a task.
+    tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
+        .await
+        .map_err(|_| anyhow::anyhow!("hook client read timed out"))??;
+
+    let trimmed = line.trim();
+
+    // Two client shapes share this socket. HookRequest is the hot path, so try
+    // it first; an AdminRequest (which has `command`, not `event`) fails that
+    // parse and falls through. The two are structurally disjoint, so there's no
+    // ambiguity. Each gets its own response type serialized back.
+    if let Ok(req) = serde_json::from_str::<HookRequest>(trimmed) {
+        let resp = if req.token == token {
+            let (tx, rx) = oneshot::channel();
+            if ev_tx.send(Event::Hook(req.event, tx)).await.is_err() {
+                HookResponse::Error {
+                    message: "daemon shutting down".into(),
+                }
+            } else {
+                rx.await.unwrap_or(HookResponse::Defer {
+                    reason: "daemon dropped the request".into(),
+                })
+            }
+        } else {
+            HookResponse::Error {
+                message: "bad token".into(),
+            }
+        };
+        return write_response(&mut write_half, &resp).await;
+    }
+
+    if let Ok(req) = serde_json::from_str::<AdminRequest>(trimmed) {
+        let resp = if req.token == token {
+            let (tx, rx) = oneshot::channel();
+            if ev_tx
+                .send(Event::DeviceCommand(req.command, tx))
+                .await
+                .is_err()
+            {
+                AdminResponse::Error {
+                    message: "daemon shutting down".into(),
+                }
+            } else {
+                rx.await.unwrap_or(AdminResponse::Error {
+                    message: "daemon dropped the request".into(),
+                })
+            }
+        } else {
+            AdminResponse::Error {
+                message: "bad token".into(),
+            }
+        };
+        return write_response(&mut write_half, &resp).await;
+    }
+
+    if let Ok(req) = serde_json::from_str::<QueryRequest>(trimmed) {
+        let resp = if req.token == token {
+            let (tx, rx) = oneshot::channel();
+            if ev_tx.send(Event::Query(req.query, tx)).await.is_err() {
+                QueryResponse::Error {
+                    message: "daemon shutting down".into(),
+                }
+            } else {
+                rx.await.unwrap_or(QueryResponse::Error {
+                    message: "daemon dropped the request".into(),
+                })
+            }
+        } else {
+            QueryResponse::Error {
+                message: "bad token".into(),
+            }
+        };
+        return write_response(&mut write_half, &resp).await;
+    }
+
+    write_response(
+        &mut write_half,
+        &HookResponse::Error {
+            message: "unrecognized request".into(),
+        },
+    )
+    .await
+}
+
+/// Write a JSON response line to an IPC client.
+async fn write_response<T: Serialize>(
+    write_half: &mut (impl AsyncWriteExt + Unpin),
+    resp: &T,
+) -> Result<()> {
+    let mut bytes = serde_json::to_vec(resp)?;
+    bytes.push(b'\n');
+    write_half.write_all(&bytes).await?;
+    write_half.flush().await?;
+    Ok(())
+}
+
+/// Reconnect backoff bounds: start tight so a returning buddy is picked up
+/// promptly, then grow to save battery/CPU while it's away. Reset to the floor
+/// on a successful connect.
+const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(2);
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// Classify a connect error into a short, user-facing reason for the status UI.
+/// String-based for now; when ble.rs grows typed error kinds (cross-bucket),
+/// this is the single place to switch on them instead.
+fn classify_connect_error(e: &anyhow::Error) -> String {
+    let s = e.to_string();
+    let low = s.to_ascii_lowercase();
+    if low.contains("no bluetooth adapter") {
+        "no Bluetooth adapter found — is Bluetooth hardware present?".into()
+    } else if low.contains("bluetooth") || low.contains("permit") || low.contains("scan") {
+        "couldn't start a Bluetooth scan — is Bluetooth on and permitted?".into()
+    } else if low.contains("no claude buddy found") {
+        "no buddy found nearby — make sure it's powered on and awake".into()
+    } else {
+        s
+    }
+}
+
+/// Maintain the BLE connection: connect, forward lines, reconnect on drop.
+fn spawn_ble_manager(preferred: Option<String>, ev_tx: mpsc::Sender<Event>) {
+    tokio::spawn(async move {
+        // Same-lifetime reconnect should prefer the device we actually linked
+        // to. Seeded from config, then narrowed to the connected peripheral id
+        // after the first successful link (below).
+        let mut preferred = preferred;
+        let mut backoff = RECONNECT_BACKOFF_MIN;
+        loop {
+            match BleLink::connect(preferred.as_deref(), SCAN_SECS).await {
+                Ok((link, mut lines, connected_id)) => {
+                    backoff = RECONNECT_BACKOFF_MIN; // reset on success
+                                                     // Pin same-lifetime reconnects to the device we actually
+                                                     // linked to, so a returning buddy is matched directly
+                                                     // instead of re-running advertise discovery.
+                    preferred = Some(connected_id);
+                    // Keep macOS from idle-sleeping (and powering down the BT
+                    // radio) for the life of this connection, so the link
+                    // survives the screen going dark. Released automatically
+                    // when `_sleep_guard` drops as we leave this match arm on
+                    // disconnect. The display still sleeps normally.
+                    let _sleep_guard =
+                        crate::power::PowerAssertion::prevent_idle_sleep("Claude buddy connected");
+                    if ev_tx
+                        .send(Event::Connected(Link::Ble(link.clone())))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    // Forward lines until the link drops. Detect a drop FAST:
+                    // race the line pump against a 2s liveness poll. On macOS a
+                    // dropped BLE link often leaves the notify channel open (no
+                    // clean `None`), so without the poll we'd wait the whole
+                    // LIVENESS_TIMEOUT — that was the ~15s recovery lag. is_connected()
+                    // reports the drop within ~2s; the silence deadline stays as the
+                    // backstop for a wedged-but-"connected" link.
+                    let mut last_line = std::time::Instant::now();
+                    loop {
+                        tokio::select! {
+                            r = lines.recv() => match r {
+                                Some(line) => {
+                                    last_line = std::time::Instant::now();
+                                    if ev_tx.send(Event::DeviceLine(line)).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                None => break, // pump closed: clean disconnect
+                            },
+                            _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                                let gone = !matches!(
+                                    tokio::time::timeout(Duration::from_secs(2), link.is_connected()).await,
+                                    Ok(true)
+                                );
+                                if gone {
+                                    warn!("link dropped — reconnecting");
+                                    break;
+                                }
+                                if last_line.elapsed() >= LIVENESS_TIMEOUT {
+                                    warn!(
+                                        "no device traffic in {}s — forcing reconnect",
+                                        LIVENESS_TIMEOUT.as_secs()
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    // Best-effort cleanup, bounded: on a wedged macOS link the
+                    // disconnect ack rides the same dead event loop and never
+                    // returns, so we must not await it unbounded.
+                    let _ = tokio::time::timeout(Duration::from_secs(2), link.disconnect()).await;
+                    if ev_tx.send(Event::Disconnected).await.is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    let reason = classify_connect_error(&e);
+                    debug!("connect attempt failed: {e}");
+                    // Surface the classified reason to the status UI. Ignore a
+                    // send failure (owner loop gone → we'll exit next iteration).
+                    let _ = ev_tx.send(Event::ConnectError(reason)).await;
+                }
+            }
+            // Keep retrying forever, but pace it: tight floor so a returning
+            // buddy is picked up within a scan window, growing to a cap so an
+            // absent buddy doesn't keep the radio hot. Reset to the floor on a
+            // successful connect (above).
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+        }
+    });
+}
+
+fn spawn_keepalive(ev_tx: mpsc::Sender<Event>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(KEEPALIVE);
+        loop {
+            tick.tick().await;
+            if ev_tx.send(Event::Keepalive).await.is_err() {
+                return;
+            }
+        }
+    });
+}
+
+/// Periodically check GitHub for a newer claude-buddy release and feed the
+/// result to the owner loop (surfaced to the desktop app). The HTTP call shells
+/// out to `curl` and is blocking, so it runs on `spawn_blocking`. A failed check
+/// (offline, rate-limited) is logged at debug and simply skipped — the last good
+/// result, if any, stays in effect until the next success.
+fn spawn_update_checker(ev_tx: mpsc::Sender<Event>) {
+    tokio::spawn(async move {
+        // Don't compete with startup: let the BLE connect + first heartbeat land
+        // before doing network I/O, then check immediately and on a long cadence.
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        let current = env!("CARGO_PKG_VERSION").to_string();
+        loop {
+            match tokio::task::spawn_blocking(crate::update::latest_release).await {
+                Ok(Ok(rel)) => {
+                    let available = crate::update::is_newer(&rel.tag, &current);
+                    let info = UpdateStatus {
+                        current: current.clone(),
+                        latest: rel.tag,
+                        available,
+                        url: rel.url,
+                    };
+                    if ev_tx.send(Event::UpdateInfo(info)).await.is_err() {
+                        return; // owner loop gone
+                    }
+                }
+                Ok(Err(e)) => debug!("update check failed: {e}"),
+                Err(e) => debug!("update check task panicked: {e}"),
+            }
+            tokio::time::sleep(UPDATE_CHECK_INTERVAL).await;
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Filename (under the config dir) of the daemon's single-instance lock.
+const LOCK_FILE: &str = "daemon.lock";
+
+/// Holds the daemon's single-instance lock open for the process lifetime. The
+/// flock is released automatically when this drops or the process exits — no
+/// stale PID/lock file to clean up after a crash.
+struct SingletonLock(#[allow(dead_code)] std::fs::File);
+
+/// Take the exclusive single-instance lock, or fail with a clear message if
+/// another daemon already holds it.
+#[cfg(unix)]
+fn acquire_singleton_lock() -> Result<SingletonLock> {
+    use std::os::unix::io::AsRawFd;
+    let path = config_dir()?.join(LOCK_FILE);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening lock file {}", path.display()))?;
+
+    // LOCK_EX | LOCK_NB: grab the exclusive lock or return immediately. Contention
+    // here is usually *benign and transient*: a service reload (launchctl
+    // unload→load) or a restart races the old process releasing its fd. Retry a
+    // few times over ~1.5s to ride out that handoff before concluding a real
+    // second instance is running.
+    let mut last_err = std::io::Error::last_os_error();
+    for attempt in 0..5 {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(SingletonLock(file));
+        }
+        last_err = std::io::Error::last_os_error();
+        if !matches!(last_err.raw_os_error(), Some(libc::EWOULDBLOCK)) {
+            // A non-contention error (e.g. EINTR/ENOLCK) — surface it.
+            return Err(
+                anyhow::Error::from(last_err).context(format!("flock on {}", path.display()))
+            );
+        }
+        if attempt < 4 {
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+
+    // Still held after the retries: another daemon really owns the link. Exit
+    // *cleanly* (status 0) rather than bailing non-zero. A non-zero exit would
+    // make launchd treat the loser as a crash and crash-loop it; a clean exit
+    // lets the service manager's KeepAlive/SuccessfulExit policy back off.
+    let _ = last_err;
+    info!(
+        "another claude-buddy daemon already holds the lock on {} — exiting cleanly; \
+         the running instance owns the buddy. To restart the service: \
+         `launchctl kickstart -k gui/$(id -u)/com.anthropic.claude-buddy`.",
+        path.display()
+    );
+    std::process::exit(0);
+}
+
+/// Non-unix fallback: no advisory lock available, so rely on the OS service
+/// manager to keep a single instance. Still opens the file so the guard type is
+/// uniform across platforms.
+#[cfg(not(unix))]
+fn acquire_singleton_lock() -> Result<SingletonLock> {
+    warn!("single-instance lock not enforced on this platform");
+    let path = config_dir()?.join(LOCK_FILE);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening lock file {}", path.display()))?;
+    Ok(SingletonLock(file))
+}
+
+fn write_endpoint(ep: &Endpoint) -> Result<()> {
+    let path = config_dir()?.join(ENDPOINT_FILE);
+    // Write to a temp file then rename, so a reader never sees a half-written
+    // (unparseable) endpoint.json — important now that a stale file is probed
+    // and removed elsewhere; the rename is atomic on the same filesystem.
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(ep)?)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    // Best-effort tighten perms on unix (token gates the socket).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::rename(&tmp, &path).with_context(|| format!("publishing {}", path.display()))?;
+    Ok(())
+}
+
+/// Process-wide local UTC offset, captured once at startup *before* the tokio
+/// runtime spawns threads (see `crate::capture_local_offset`). `time`'s
+/// `current_local_offset()` refuses to run once the process is multithreaded,
+/// so reading it lazily here would almost always yield UTC.
+pub static LOCAL_OFFSET: std::sync::OnceLock<time::UtcOffset> = std::sync::OnceLock::new();
+
+/// `(unix_epoch_secs, utc_offset_secs, local_YYYY-MM-DD)`.
+fn local_now() -> (i64, i32, String) {
+    use time::{OffsetDateTime, UtcOffset};
+    let offset = *LOCAL_OFFSET.get().unwrap_or(&UtcOffset::UTC);
+    let now = OffsetDateTime::now_utc();
+    let local = now.to_offset(offset);
+    let date = format!(
+        "{:04}-{:02}-{:02}",
+        local.year(),
+        local.month() as u8,
+        local.day()
+    );
+    (now.unix_timestamp(), offset.whole_seconds(), date)
+}
+
+/// If the local day rolled over, reset the daily counter. Returns true if
+/// anything changed (so the caller can persist).
+fn config_token_day_changed(config: &mut Config, state: &mut SessionState) -> bool {
+    let (_, _, today) = local_now();
+    if state.tokens_day != today && !state.tokens_day.is_empty() {
+        state.add_tokens(0, &today); // rolls the counter
+        state.sync_to_config(config);
+        return true;
+    }
+    false
+}
+
+/// Serialized byte length of a heartbeat line, including the trailing `\n` the
+/// wire adds (matching [`protocol::to_line`]).
+fn heartbeat_line_len(hb: &Heartbeat) -> usize {
+    // serde_json::to_vec on a Heartbeat can't fail (no non-string map keys, no
+    // serialize errors), but be defensive: an error here just means "treat it
+    // as over budget" so we keep shedding rather than panic.
+    serde_json::to_vec(hb)
+        .map(|v| v.len() + 1)
+        .unwrap_or(usize::MAX)
+}
+
+/// Shed the largest variable contributors from a heartbeat until its serialized
+/// line fits [`protocol::MAX_LINE_BYTES`], so a multibyte-heavy heartbeat can't
+/// overflow the firmware line buffer and get dropped whole. Entries go first
+/// (the ticker simply shows fewer recent lines), then per-session rows. The
+/// prompt and counters are never shed — they're the load-bearing payload.
+fn enforce_line_budget(hb: &mut Heartbeat) {
+    while heartbeat_line_len(hb) > MAX_LINE_BYTES && !hb.entries.is_empty() {
+        hb.entries.pop(); // drop the oldest (entries are newest-first)
+    }
+    while heartbeat_line_len(hb) > MAX_LINE_BYTES && !hb.sessions.is_empty() {
+        hb.sessions.pop();
+    }
+}
+
+/// Truncate `s` to at most `max` **bytes**, appending a `…` (3 bytes) when it
+/// had to cut — the ellipsis is counted *inside* the budget so the result never
+/// exceeds `max` bytes. Cuts on a char boundary so multibyte text is never
+/// split. Byte-bounded (not char-bounded) because the firmware reassembles each
+/// line into a fixed-size buffer measured in bytes; see [`protocol::MAX_LINE_BYTES`].
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    // Reserve room for the 3-byte ellipsis.
+    let budget = max.saturating_sub("…".len());
+    let end = s
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|&i| i <= budget)
+        .last()
+        .unwrap_or(0);
+    let mut out = s[..end].to_string();
+    out.push('…');
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_is_byte_bounded_with_ellipsis_inside_budget() {
+        // Short string passes through untouched, no ellipsis.
+        assert_eq!(truncate("hello", 23), "hello");
+        // ASCII over budget: result (incl. the 3-byte '…') never exceeds max.
+        let out = truncate("abcdefghij", 6);
+        assert!(out.len() <= 6, "len {} > 6", out.len());
+        assert!(out.ends_with('…'));
+        // Multibyte: never split a codepoint and never exceed the byte budget.
+        let s = "héllo wörld with açcénts everywhere";
+        let out = truncate(s, 12);
+        assert!(out.len() <= 12, "len {} > 12", out.len());
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn enforce_line_budget_sheds_entries_then_sessions() {
+        // Build a heartbeat whose serialized line clearly overruns the budget
+        // via many long entries, then confirm shedding brings it under.
+        let big = "x".repeat(200);
+        let hb = Heartbeat {
+            total: 3,
+            msg: "working".into(),
+            entries: (0..20).map(|_| big.clone()).collect(),
+            sessions: (0..6)
+                .map(|i| protocol::SessionInfo {
+                    id: format!("sess{i}"),
+                    cwd: "project".into(),
+                    st: "run",
+                    tok: 1234,
+                    m: "opus".into(),
+                    ctx: 42,
+                    ctok: 84_000,
+                    clim: 200_000,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert!(heartbeat_line_len(&hb) > MAX_LINE_BYTES);
+        let mut hb = hb;
+        enforce_line_budget(&mut hb);
+        assert!(
+            heartbeat_line_len(&hb) <= MAX_LINE_BYTES,
+            "line still {} bytes",
+            heartbeat_line_len(&hb)
+        );
+        // Entries are shed before sessions: with entries alone enough to get
+        // under budget, the sessions should be untouched.
+        assert_eq!(hb.sessions.len(), 6);
+    }
+
+    #[test]
+    fn enforce_line_budget_keeps_a_small_heartbeat_intact() {
+        let mut hb = Heartbeat {
+            total: 1,
+            msg: "idle".into(),
+            entries: vec!["did a thing".into(), "did another".into()],
+            ..Default::default()
+        };
+        let before = hb.entries.len();
+        enforce_line_budget(&mut hb);
+        assert_eq!(hb.entries.len(), before); // nothing shed
+    }
+}

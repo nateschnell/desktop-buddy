@@ -1,0 +1,384 @@
+name: release
+
+# Builds, for each platform:
+#   * the claude-buddy daemon/CLI archive (claude-buddy-<target>.tar.gz/.zip) —
+#     what install.sh / install.ps1 download, and
+#   * a one-download desktop package — a macOS .dmg (universal .app), a Windows
+#     Setup.exe (Inno Setup), and a Linux .AppImage — each carrying the GUI, the
+#     daemon, and the firmware images, so a user can download one file, open it,
+#     and have the app install the background service + hooks on first run.
+# plus the CYD + FNK0104 firmware images, attached to the GitHub Release.
+#
+# BLE links against OS-native frameworks (CoreBluetooth / WinRT / BlueZ), so
+# each bridge target builds on its own native runner rather than cross-compiling.
+# The firmware is board code (platform-independent), built once and bundled into
+# every platform's archive AND desktop package so the app can flash it OTA.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  # Firmware is built from a SEPARATE PRIVATE repo (the board source isn't
+  # public). Here we just fetch the prebuilt, already-public firmware *binaries*
+  # (firmware-<board>.bin + .version) from that repo's latest release and pass
+  # them down to the build/packaging jobs, which bundle them into the app for
+  # one-click OTA. Requires the FIRMWARE_REPO_TOKEN secret: a fine-grained PAT
+  # with read-only Contents access to the private firmware repo.
+  firmware:
+    name: firmware (fetch from private repo)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download prebuilt firmware from private repo
+        env:
+          GH_TOKEN: ${{ secrets.FIRMWARE_REPO_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::FIRMWARE_REPO_TOKEN not set — cannot fetch firmware images." >&2
+            exit 1
+          fi
+          mkdir -p dist
+          # Latest release of the private firmware repo. The images are version-
+          # stamped by the firmware build, so the bundled .version stays accurate.
+          gh release download --repo nateschnell/buddy --dir dist \
+            --pattern 'firmware-*.bin'     --pattern 'firmware-*.version' \
+            --pattern 'firmware.bin'       --pattern 'firmware.version'
+          echo "fetched:"; ls -l dist
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: dist/
+
+      - name: Attach firmware to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/firmware-cyd.bin
+            dist/firmware-cyd.version
+            dist/firmware-fnk0104.bin
+            dist/firmware-fnk0104.version
+            dist/firmware.bin
+            dist/firmware.version
+
+  # Compile both binaries (daemon/CLI + GUI) per target, attach the CLI archive
+  # that install.sh/.ps1 consume, and upload the raw binaries for the desktop
+  # packaging jobs below.
+  build:
+    name: build ${{ matrix.target }}
+    needs: firmware
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14 # Apple silicon — native arm64
+            target: aarch64-apple-darwin
+            ext: tar.gz
+          - os: macos-14 # Apple silicon cross-compiles x86_64 (universal SDK);
+            target: x86_64-apple-darwin # avoids the scarce/slow macos-13 runner
+            ext: tar.gz
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            ext: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: zip
+    defaults:
+      run:
+        working-directory: bridge
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Cache the cargo registry + target dir per (target, lockfile) so repeat
+      # runs skip recompiling the (large) eframe/tray dependency tree — cuts a
+      # cold ~8min build to ~1-2min. Keyed on the target so the cross-compiled
+      # x86_64 mac build doesn't clobber the native arm64 one.
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bridge
+          key: ${{ matrix.target }}-gui
+
+      # BLE (libdbus) + the egui/tray GUI need extra dev headers on Linux.
+      - name: Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libdbus-1-dev pkg-config \
+            libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libssl-dev libxdo-dev libayatana-appindicator3-dev
+
+      # `--features gui` builds the desktop app (claude-buddy-app) alongside the
+      # daemon/CLI (claude-buddy) from the one crate.
+      - name: Build (daemon + GUI)
+        run: cargo build --release --features gui --target ${{ matrix.target }}
+
+      - name: Download firmware
+        uses: actions/download-artifact@v4
+        with:
+          name: firmware
+          path: bridge/fw
+
+      # --- CLI archive (unchanged contract: install.sh/.ps1 fetch these) ------
+      - name: Package CLI archive (unix)
+        if: matrix.ext == 'tar.gz'
+        run: |
+          mkdir -p stage
+          cp target/${{ matrix.target }}/release/claude-buddy stage/
+          cp fw/firmware*.bin fw/firmware*.version stage/
+          tar -C stage -czf claude-buddy-${{ matrix.target }}.tar.gz .
+
+      - name: Package CLI archive (windows)
+        if: matrix.ext == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path stage | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/claude-buddy.exe stage/
+          Copy-Item fw/firmware*.bin, fw/firmware*.version stage/
+          Compress-Archive -Path stage/* `
+            -DestinationPath claude-buddy-${{ matrix.target }}.zip -Force
+
+      - name: Attach CLI archive to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: bridge/claude-buddy-${{ matrix.target }}.${{ matrix.ext }}
+
+      - name: Upload CLI archive (manual runs)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.target }}
+          path: bridge/claude-buddy-${{ matrix.target }}.${{ matrix.ext }}
+
+      # --- raw binaries for the desktop packaging jobs -----------------------
+      - name: Stage raw binaries (unix)
+        if: matrix.ext == 'tar.gz'
+        run: |
+          mkdir -p bin
+          cp target/${{ matrix.target }}/release/claude-buddy bin/
+          cp target/${{ matrix.target }}/release/claude-buddy-app bin/
+
+      - name: Stage raw binaries (windows)
+        if: matrix.ext == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path bin | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/claude-buddy.exe bin/
+          Copy-Item target/${{ matrix.target }}/release/claude-buddy-app.exe bin/
+
+      - name: Upload raw binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: bridge/bin/
+
+  # --- desktop packages: one download per platform -------------------------
+
+  # macOS: lipo the two arch builds into a universal .app, wrap in a .dmg.
+  package-macos:
+    name: package macOS (.dmg)
+    needs: [build, firmware]
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve version
+        id: ver
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$(git describe --tags --always --dirty 2>/dev/null || echo dev)" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/download-artifact@v4
+        with: { name: bin-aarch64-apple-darwin, path: arm64 }
+      - uses: actions/download-artifact@v4
+        with: { name: bin-x86_64-apple-darwin, path: x86_64 }
+      - uses: actions/download-artifact@v4
+        with: { name: firmware, path: fw }
+      - name: Lipo to universal binaries
+        run: |
+          mkdir -p universal
+          for b in claude-buddy claude-buddy-app; do
+            lipo -create -output "universal/$b" "arm64/$b" "x86_64/$b"
+            chmod +x "universal/$b"
+          done
+          lipo -info universal/claude-buddy-app
+      # --- code signing + notarization --------------------------------------
+      # Gated on the cert secret being present: with it, we produce a real
+      # Developer ID-signed + notarized + stapled .dmg (no Gatekeeper prompt);
+      # without it (e.g. a fork that has no secrets), make-app.sh falls back to
+      # an ad-hoc signature so the job still succeeds. SAFE FOR PUBLIC REPOS:
+      # this workflow has NO pull_request trigger (only tag pushes +
+      # workflow_dispatch), so fork PRs never run it and never see these
+      # secrets; the signing cert is imported into an ephemeral per-run keychain
+      # in $RUNNER_TEMP and the .p8 is shredded right after use.
+      - name: Detect signing secrets
+        id: signing
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+        run: |
+          if [ -n "$CERT_P12" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::macOS signing secrets absent — emitting an ad-hoc-signed, UN-notarized .dmg (one-time right-click->Open for users)."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Import Developer ID certificate
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          CERT_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/buddy-signing.keychain-db"
+          KEYCHAIN_PWD="$(openssl rand -base64 24)"
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          printf '%s' "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERT_PWD" \
+            -T /usr/bin/codesign
+          # Let codesign use the key without an interactive prompt.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PWD" "$KEYCHAIN" >/dev/null
+          # Make the temp keychain searchable alongside the runner's defaults.
+          security list-keychains -d user -s "$KEYCHAIN" \
+            $(security list-keychains -d user | sed 's/["]//g')
+          rm -f "$RUNNER_TEMP/cert.p12"
+      - name: Build .app + .dmg
+        env:
+          # Empty when no secret -> make-app.sh ad-hoc signs. The full
+          # "Developer ID Application: …" string lives in the secret.
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: |
+          mkdir -p out
+          bash packaging/macos/make-app.sh \
+            --bin-dir universal --fw-dir fw --out out \
+            --version "${{ steps.ver.outputs.version }}"
+      - name: Notarize + staple
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          NOTARY_P8: ${{ secrets.MACOS_NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
+        run: |
+          printf '%s' "$NOTARY_P8" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          DMG="$(ls out/*.dmg)"
+          xcrun notarytool submit "$DMG" \
+            --key "$RUNNER_TEMP/notary.p8" \
+            --key-id "$NOTARY_KEY_ID" \
+            --issuer "$NOTARY_ISSUER" \
+            --wait --timeout 30m
+          rm -f "$RUNNER_TEMP/notary.p8"
+          # Staple the ticket so the .dmg validates offline, then prove it.
+          xcrun stapler staple "$DMG"
+          xcrun stapler validate "$DMG"
+          spctl -a -t open --context context:primary-signature -vv "$DMG"
+      - name: Attach .dmg to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*.dmg
+      - name: Upload .dmg (manual runs)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: out/*.dmg
+
+  # Windows: Inno Setup installer bundling both binaries + firmware.
+  package-windows:
+    name: package Windows (Setup.exe)
+    needs: [build, firmware]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$(git describe --tags --always --dirty 2>/dev/null || echo dev)" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/download-artifact@v4
+        with: { name: bin-x86_64-pc-windows-msvc, path: stage }
+      - uses: actions/download-artifact@v4
+        with: { name: firmware, path: stage }
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+      - name: Build installer
+        shell: cmd
+        run: >
+          iscc /DAppVersion=${{ steps.ver.outputs.version }}
+          /DStageDir=${{ github.workspace }}\stage
+          packaging\windows\installer.iss
+      - name: Attach Setup.exe to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: packaging/windows/Claude-Buddy-Setup-*.exe
+      - name: Upload Setup.exe (manual runs)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-setup
+          path: packaging/windows/Claude-Buddy-Setup-*.exe
+
+  # Linux: a single self-contained AppImage.
+  package-linux:
+    name: package Linux (.AppImage)
+    needs: [build, firmware]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve version
+        id: ver
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$(git describe --tags --always --dirty 2>/dev/null || echo dev)" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/download-artifact@v4
+        with: { name: bin-x86_64-unknown-linux-gnu, path: bin }
+      - uses: actions/download-artifact@v4
+        with: { name: firmware, path: fw }
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update && sudo apt-get install -y imagemagick libfuse2
+          curl -fsSL -o /usr/local/bin/appimagetool \
+            https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x /usr/local/bin/appimagetool
+      - name: Build AppImage
+        run: |
+          chmod +x bin/claude-buddy bin/claude-buddy-app
+          mkdir -p out
+          bash packaging/linux/make-appimage.sh \
+            --bin-dir bin --fw-dir fw --out out \
+            --version "${{ steps.ver.outputs.version }}"
+      - name: Attach AppImage to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*.AppImage
+      - name: Upload AppImage (manual runs)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-appimage
+          path: out/*.AppImage

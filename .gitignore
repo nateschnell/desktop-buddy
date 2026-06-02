@@ -1,0 +1,13 @@
+# Rust build artifacts
+/bridge/target/
+
+# Packaging output
+/out/
+
+# macOS
+.DS_Store
+
+# Signing material — never commit (CI uses GitHub secrets instead)
+*.p12
+*.p8
+*.cer

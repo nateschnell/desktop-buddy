@@ -1,0 +1,64 @@
+[package]
+name = "claude-buddy"
+version = "0.1.0"
+edition = "2021"
+description = "Bridge daemon that connects a CYD (Cheap Yellow Display) hardware buddy to Claude Code over BLE."
+license = "MIT"
+repository = "https://github.com/nateschnell/desktop-buddy"
+default-run = "claude-buddy"
+
+[[bin]]
+name = "claude-buddy"
+path = "src/main.rs"
+
+# Desktop control panel. Only built with `--features gui`, which keeps the GUI
+# toolkit out of the default daemon/CLI build.
+[[bin]]
+name = "claude-buddy-app"
+path = "src/bin/app.rs"
+required-features = ["gui"]
+
+[features]
+default = []
+# Pulls in the native GUI toolkit + tray for the `claude-buddy-app` binary.
+gui = ["dep:eframe", "dep:tray-icon"]
+
+[dependencies]
+# Async runtime — the daemon juggles BLE I/O, an IPC server, and timers.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal", "fs"] }
+futures = "0.3"
+
+# Cross-platform BLE central (CoreBluetooth / WinRT / BlueZ).
+btleplug = "0.11"
+
+# Wire + IPC + config serialization.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI.
+clap = { version = "4", features = ["derive"] }
+
+# Plumbing.
+anyhow = "1"
+# MD5 of the firmware image for the ArduinoOTA (espota) handshake.
+md5 = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+# Cross-platform config/state directory (~/.config, %APPDATA%, ~/Library).
+directories = "5"
+
+# Owner-name default + local timezone offset for the time-sync message.
+whoami = "1"
+time = { version = "0.3", features = ["local-offset"] }
+
+# Native GUI toolkit + system tray for the desktop control panel
+# (`claude-buddy-app`). Optional: only compiled in under the `gui` feature.
+eframe = { version = "0.28", optional = true }
+tray-icon = { version = "0.14", optional = true }
+
+# flock(2) for the daemon's single-instance lock. Already pulled in
+# transitively by tokio/btleplug, so this adds no new download.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
