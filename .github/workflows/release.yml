@@ -1,7 +1,7 @@
 name: release
 
 # Builds, for each platform:
-#   * the claude-buddy daemon/CLI archive (claude-buddy-<target>.tar.gz/.zip) —
+#   * the agent-buddy daemon/CLI archive (agent-buddy-<target>.tar.gz/.zip) —
 #     what install.sh / install.ps1 download, and
 #   * a one-download desktop package — a macOS .dmg (universal .app), a Windows
 #     Setup.exe (Inno Setup), and a Linux .AppImage — each carrying the GUI, the
@@ -121,8 +121,8 @@ jobs:
             libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libxkbcommon-dev libssl-dev libxdo-dev libayatana-appindicator3-dev
 
-      # `--features gui` builds the desktop app (claude-buddy-app) alongside the
-      # daemon/CLI (claude-buddy) from the one crate.
+      # `--features gui` builds the desktop app (agent-buddy-app) alongside the
+      # daemon/CLI (agent-buddy) from the one crate.
       - name: Build (daemon + GUI)
         run: cargo build --release --features gui --target ${{ matrix.target }}
 
@@ -137,48 +137,48 @@ jobs:
         if: matrix.ext == 'tar.gz'
         run: |
           mkdir -p stage
-          cp target/${{ matrix.target }}/release/claude-buddy stage/
+          cp target/${{ matrix.target }}/release/agent-buddy stage/
           cp fw/firmware*.bin fw/firmware*.version stage/
-          tar -C stage -czf claude-buddy-${{ matrix.target }}.tar.gz .
+          tar -C stage -czf agent-buddy-${{ matrix.target }}.tar.gz .
 
       - name: Package CLI archive (windows)
         if: matrix.ext == 'zip'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path stage | Out-Null
-          Copy-Item target/${{ matrix.target }}/release/claude-buddy.exe stage/
+          Copy-Item target/${{ matrix.target }}/release/agent-buddy.exe stage/
           Copy-Item fw/firmware*.bin, fw/firmware*.version stage/
           Compress-Archive -Path stage/* `
-            -DestinationPath claude-buddy-${{ matrix.target }}.zip -Force
+            -DestinationPath agent-buddy-${{ matrix.target }}.zip -Force
 
       - name: Attach CLI archive to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: bridge/claude-buddy-${{ matrix.target }}.${{ matrix.ext }}
+          files: bridge/agent-buddy-${{ matrix.target }}.${{ matrix.ext }}
 
       - name: Upload CLI archive (manual runs)
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         uses: actions/upload-artifact@v4
         with:
           name: cli-${{ matrix.target }}
-          path: bridge/claude-buddy-${{ matrix.target }}.${{ matrix.ext }}
+          path: bridge/agent-buddy-${{ matrix.target }}.${{ matrix.ext }}
 
       # --- raw binaries for the desktop packaging jobs -----------------------
       - name: Stage raw binaries (unix)
         if: matrix.ext == 'tar.gz'
         run: |
           mkdir -p bin
-          cp target/${{ matrix.target }}/release/claude-buddy bin/
-          cp target/${{ matrix.target }}/release/claude-buddy-app bin/
+          cp target/${{ matrix.target }}/release/agent-buddy bin/
+          cp target/${{ matrix.target }}/release/agent-buddy-app bin/
 
       - name: Stage raw binaries (windows)
         if: matrix.ext == 'zip'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path bin | Out-Null
-          Copy-Item target/${{ matrix.target }}/release/claude-buddy.exe bin/
-          Copy-Item target/${{ matrix.target }}/release/claude-buddy-app.exe bin/
+          Copy-Item target/${{ matrix.target }}/release/agent-buddy.exe bin/
+          Copy-Item target/${{ matrix.target }}/release/agent-buddy-app.exe bin/
 
       - name: Upload raw binaries
         uses: actions/upload-artifact@v4
@@ -212,11 +212,11 @@ jobs:
       - name: Lipo to universal binaries
         run: |
           mkdir -p universal
-          for b in claude-buddy claude-buddy-app; do
+          for b in agent-buddy agent-buddy-app; do
             lipo -create -output "universal/$b" "arm64/$b" "x86_64/$b"
             chmod +x "universal/$b"
           done
-          lipo -info universal/claude-buddy-app
+          lipo -info universal/agent-buddy-app
       # --- code signing + notarization --------------------------------------
       # Gated on the cert secret being present: with it, we produce a real
       # Developer ID-signed + notarized + stapled .dmg (no Gatekeeper prompt);
@@ -331,13 +331,13 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: packaging/windows/Claude-Buddy-Setup-*.exe
+          files: packaging/windows/Agent-Buddy-Setup-*.exe
       - name: Upload Setup.exe (manual runs)
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         uses: actions/upload-artifact@v4
         with:
           name: windows-setup
-          path: packaging/windows/Claude-Buddy-Setup-*.exe
+          path: packaging/windows/Agent-Buddy-Setup-*.exe
 
   # Linux: a single self-contained AppImage.
   package-linux:
@@ -366,7 +366,7 @@ jobs:
           chmod +x /usr/local/bin/appimagetool
       - name: Build AppImage
         run: |
-          chmod +x bin/claude-buddy bin/claude-buddy-app
+          chmod +x bin/agent-buddy bin/agent-buddy-app
           mkdir -p out
           bash packaging/linux/make-appimage.sh \
             --bin-dir bin --fw-dir fw --out out \
