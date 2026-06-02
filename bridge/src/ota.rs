@@ -196,13 +196,13 @@ fn firmware_filenames(board: &str) -> Vec<String> {
 }
 
 /// Path to the firmware image bundled with the desktop app for `board`, resolved
-/// relative to the running executable: `…/Claude Buddy.app/Contents/Resources/`
+/// relative to the running executable: `…/Agent Buddy.app/Contents/Resources/`
 /// on macOS (the GUI lives in `Contents/MacOS`), or alongside the binary for dev
 /// runs. Returns `None` if no matching image exists.
 pub fn bundled_firmware_path(board: &str) -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let macos_dir = exe.parent()?;
-    // Contents/MacOS/claude-buddy-app -> Contents/Resources/, else beside the binary.
+    // Contents/MacOS/agent-buddy-app -> Contents/Resources/, else beside the binary.
     let dirs = [macos_dir.parent().map(|p| p.join("Resources")), Some(macos_dir.to_path_buf())];
     for dir in dirs.into_iter().flatten() {
         for name in firmware_filenames(board) {

@@ -1,4 +1,4 @@
-//! Checking GitHub Releases for a newer claude-buddy, plus version-string
+//! Checking GitHub Releases for a newer agent-buddy, plus version-string
 //! comparison shared with the firmware-update path.
 //!
 //! Two consumers:
@@ -15,8 +15,8 @@ use anyhow::{anyhow, Context, Result};
 use std::process::Command;
 
 /// `owner/repo` to check for releases. Single source of truth, kept in sync with
-/// `install.sh`'s `CLAUDE_BUDDY_REPO` default and Cargo.toml's `repository`.
-pub const REPO: &str = "nateschnell/desktop-buddy";
+/// `install.sh`'s `AGENT_BUDDY_REPO` default and Cargo.toml's `repository`.
+pub const REPO: &str = "nateschnell/agent-buddy";
 
 /// A published release the app could update to.
 #[derive(Debug, Clone)]
@@ -42,7 +42,7 @@ pub fn latest_release() -> Result<Release> {
             "Accept: application/vnd.github+json",
             // GitHub rejects API requests without a User-Agent.
             "-H",
-            "User-Agent: claude-buddy",
+            "User-Agent: agent-buddy",
             &url,
         ])
         .output()

@@ -1,4 +1,4 @@
-//! claude-buddy — the bridge between a CYD hardware buddy and Claude Code.
+//! agent-buddy — the bridge between a CYD hardware buddy and Claude Code.
 //!
 //! One binary, several roles:
 //!   daemon  — long-running: owns the BLE link + serves hook IPC
@@ -9,10 +9,10 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use claude_buddy::{ble, client, daemon, hook, ipc, ota, protocol, setup, state};
+use agent_buddy::{ble, client, daemon, hook, ipc, ota, protocol, setup, state};
 
 #[derive(Parser)]
-#[command(name = "claude-buddy", version, about)]
+#[command(name = "agent-buddy", version, about)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -89,7 +89,7 @@ async fn async_main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("CLAUDE_BUDDY_LOG")
+            tracing_subscriber::EnvFilter::try_from_env("AGENT_BUDDY_LOG")
                 .unwrap_or_else(|_| "info".into()),
         )
         .init();
@@ -174,7 +174,7 @@ fn status() -> Result<()> {
         }
         Err(_) => {
             println!(
-                "daemon endpoint:  none (daemon not running — start with `claude-buddy daemon`)"
+                "daemon endpoint:  none (daemon not running — start with `agent-buddy daemon`)"
             );
         }
     }

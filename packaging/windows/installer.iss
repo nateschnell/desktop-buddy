@@ -1,4 +1,4 @@
-; Inno Setup script for Claude Buddy — one downloadable Setup.exe that installs
+; Inno Setup script for Agent Buddy — one downloadable Setup.exe that installs
 ; the GUI + the daemon + bundled firmware, drops a Start Menu shortcut, and
 ; launches the app. On first run the app registers the daemon as a per-user
 ; logon Scheduled Task (setup.rs::install_daemon_service) and wires the Claude
@@ -10,7 +10,7 @@
 ;
 ; Compiled in CI with:
 ;   iscc /DAppVersion=<ver> /DStageDir=<dir-with-binaries+firmware> installer.iss
-; where StageDir holds claude-buddy.exe, claude-buddy-app.exe, and firmware*.*
+; where StageDir holds agent-buddy.exe, agent-buddy-app.exe, and firmware*.*
 ;
 ; Signing (deferred): when an Authenticode cert exists, add SignTool here and a
 ; signing step in CI — the layout is otherwise unchanged.
@@ -23,17 +23,17 @@
 #endif
 
 [Setup]
-AppId={{B4D8F2A1-3C7E-4E2B-9A6F-CLAUDEBUDDY01}
-AppName=Claude Buddy
+AppId={{B4D8F2A1-3C7E-4E2B-9A6F-AGENTBUDDY01}
+AppName=Agent Buddy
 AppVersion={#AppVersion}
-AppPublisher=Anthropic
-DefaultDirName={autopf}\Claude Buddy
-DefaultGroupName=Claude Buddy
+AppPublisher=nateschnell
+DefaultDirName={autopf}\Agent Buddy
+DefaultGroupName=Agent Buddy
 DisableProgramGroupPage=yes
 ; Per-user install — no elevation, matches the per-user daemon/service model.
 PrivilegesRequired=lowest
 OutputDir=.
-OutputBaseFilename=Claude-Buddy-Setup-{#AppVersion}
+OutputBaseFilename=Agent-Buddy-Setup-{#AppVersion}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
@@ -41,24 +41,24 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 
 [Files]
-Source: "{#StageDir}\claude-buddy-app.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#StageDir}\claude-buddy.exe";     DestDir: "{app}"; Flags: ignoreversion
+Source: "{#StageDir}\agent-buddy-app.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#StageDir}\agent-buddy.exe";     DestDir: "{app}"; Flags: ignoreversion
 ; Every board's firmware image + version (and the legacy firmware.* alias) so the
 ; app's one-click OTA has an image for whichever board connects.
 Source: "{#StageDir}\firmware*.bin";        DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#StageDir}\firmware*.version";     DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Icons]
-Name: "{group}\Claude Buddy";               Filename: "{app}\claude-buddy-app.exe"
-Name: "{userdesktop}\Claude Buddy";         Filename: "{app}\claude-buddy-app.exe"; Tasks: desktopicon
+Name: "{group}\Agent Buddy";               Filename: "{app}\agent-buddy-app.exe"
+Name: "{userdesktop}\Agent Buddy";         Filename: "{app}\agent-buddy-app.exe"; Tasks: desktopicon
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"
 
 [Run]
 ; Launch the app right after install so the user lands in the setup UI.
-Filename: "{app}\claude-buddy-app.exe"; Description: "Launch Claude Buddy"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\agent-buddy-app.exe"; Description: "Launch Agent Buddy"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
 ; Tear down the logon task the app registered (best-effort; ignore if absent).
-Filename: "{cmd}"; Parameters: "/c schtasks /Delete /F /TN ClaudeBuddy"; Flags: runhidden; RunOnceId: "DelTask"
+Filename: "{cmd}"; Parameters: "/c schtasks /Delete /F /TN AgentBuddy"; Flags: runhidden; RunOnceId: "DelTask"

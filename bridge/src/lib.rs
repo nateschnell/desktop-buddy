@@ -1,8 +1,8 @@
-//! Shared library surface for the claude-buddy bridge.
+//! Shared library surface for the agent-buddy bridge.
 //!
 //! Two binaries build on this crate:
-//!   * `claude-buddy`     — the daemon + CLI (`src/main.rs`)
-//!   * `claude-buddy-app` — the desktop control panel (`src/bin/app.rs`)
+//!   * `agent-buddy`     — the daemon + CLI (`src/main.rs`)
+//!   * `agent-buddy-app` — the desktop control panel (`src/bin/app.rs`)
 //!
 //! Both speak the same IPC protocol ([`ipc`]) to the one long-running daemon
 //! that owns the BLE radio, so the GUI never touches Bluetooth itself — it is a

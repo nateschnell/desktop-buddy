@@ -1,26 +1,26 @@
 [package]
-name = "claude-buddy"
+name = "agent-buddy"
 version = "0.1.0"
 edition = "2021"
 description = "Bridge daemon that connects a CYD (Cheap Yellow Display) hardware buddy to Claude Code over BLE."
 license = "MIT"
-repository = "https://github.com/nateschnell/desktop-buddy"
-default-run = "claude-buddy"
+repository = "https://github.com/nateschnell/agent-buddy"
+default-run = "agent-buddy"
 
 [[bin]]
-name = "claude-buddy"
+name = "agent-buddy"
 path = "src/main.rs"
 
 # Desktop control panel. Only built with `--features gui`, which keeps the GUI
 # toolkit out of the default daemon/CLI build.
 [[bin]]
-name = "claude-buddy-app"
+name = "agent-buddy-app"
 path = "src/bin/app.rs"
 required-features = ["gui"]
 
 [features]
 default = []
-# Pulls in the native GUI toolkit + tray for the `claude-buddy-app` binary.
+# Pulls in the native GUI toolkit + tray for the `agent-buddy-app` binary.
 gui = ["dep:eframe", "dep:tray-icon"]
 
 [dependencies]
@@ -54,7 +54,7 @@ whoami = "1"
 time = { version = "0.3", features = ["local-offset"] }
 
 # Native GUI toolkit + system tray for the desktop control panel
-# (`claude-buddy-app`). Optional: only compiled in under the `gui` feature.
+# (`agent-buddy-app`). Optional: only compiled in under the `gui` feature.
 eframe = { version = "0.28", optional = true }
 tray-icon = { version = "0.14", optional = true }
 

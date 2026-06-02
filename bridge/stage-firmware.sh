@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 # Stage the built per-board firmware next to the desktop app / daemon so the app
-# bundles them (into Claude Buddy.app/Contents/Resources/) and can offer over-the-
+# bundles them (into Agent Buddy.app/Contents/Resources/) and can offer over-the-
 # air updates to whichever board is connected. For each board it writes
 # firmware-<board>.bin + firmware-<board>.version (and, for the CYD, a legacy
 # firmware.bin / firmware.version alias so older bundles keep working). The

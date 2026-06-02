@@ -1,4 +1,4 @@
-//! The `claude-buddy hook <event>` subcommand.
+//! The `agent-buddy hook <event>` subcommand.
 //!
 //! Claude Code spawns this on each hook event, passing the event payload as
 //! JSON on stdin. We normalize it into a [`HookEvent`], relay it to the
@@ -199,7 +199,7 @@ fn tool_hint(tool: &str, input: Option<&Value>) -> String {
 }
 
 /// The buddy project this binary was built into. The hook runs as
-/// `<root>/bridge/target/release/claude-buddy`, so the repo root is 4 ancestors
+/// `<root>/bridge/target/release/agent-buddy`, so the repo root is 4 ancestors
 /// up. `None` if the binary was moved somewhere that doesn't match — in which
 /// case we simply don't bypass (gate as normal), the safe way to fail.
 fn buddy_project_root() -> Option<std::path::PathBuf> {

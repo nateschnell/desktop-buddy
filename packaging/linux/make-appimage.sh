@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Build a single self-contained Claude-Buddy-x86_64.AppImage: one file the user
+# Build a single self-contained Agent-Buddy-x86_64.AppImage: one file the user
 # downloads, marks executable, and double-clicks. It carries BOTH binaries (GUI
 # + daemon, side by side so the GUI finds the daemon as its sibling) plus every
 # board's firmware image. On first open the app writes its .desktop entry,
@@ -26,15 +26,15 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$BIN_DIR" ] && [ -n "$OUT" ] || { echo "need --bin-dir and --out" >&2; exit 2; }
 
-GUI="$BIN_DIR/claude-buddy-app"
-DAEMON="$BIN_DIR/claude-buddy"
+GUI="$BIN_DIR/agent-buddy-app"
+DAEMON="$BIN_DIR/agent-buddy"
 [ -f "$GUI" ]    || { echo "missing GUI binary: $GUI" >&2; exit 1; }
 [ -f "$DAEMON" ] || { echo "missing daemon binary: $DAEMON" >&2; exit 1; }
 
-APPDIR="$(mktemp -d)/Claude Buddy.AppDir"
-mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/claude-buddy"
-install -m 0755 "$GUI"    "$APPDIR/usr/bin/claude-buddy-app"
-install -m 0755 "$DAEMON" "$APPDIR/usr/bin/claude-buddy"
+APPDIR="$(mktemp -d)/Agent Buddy.AppDir"
+mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/agent-buddy"
+install -m 0755 "$GUI"    "$APPDIR/usr/bin/agent-buddy-app"
+install -m 0755 "$DAEMON" "$APPDIR/usr/bin/agent-buddy"
 
 if [ -n "$FW_DIR" ] && [ -d "$FW_DIR" ]; then
   shopt -s nullglob
@@ -47,13 +47,13 @@ fi
 
 # .desktop + icon are mandatory for AppImage. Icon name must match the .desktop
 # Icon= key and a file at the AppDir root.
-cat > "$APPDIR/claude-buddy.desktop" <<'DESKTOP'
+cat > "$APPDIR/agent-buddy.desktop" <<'DESKTOP'
 [Desktop Entry]
 Type=Application
-Name=Claude Buddy
+Name=Agent Buddy
 Comment=Control panel for your Claude hardware buddy
-Exec=claude-buddy-app
-Icon=claude-buddy
+Exec=agent-buddy-app
+Icon=agent-buddy
 Categories=Utility;
 Terminal=false
 DESKTOP
@@ -61,9 +61,9 @@ DESKTOP
 # Icon: a simple generated square, or a 1x1 placeholder if ImageMagick is absent
 # (appimagetool only requires the file to exist and match the name).
 if command -v convert >/dev/null 2>&1; then
-  convert -size 256x256 xc:'#C15F3C' "$APPDIR/claude-buddy.png"
+  convert -size 256x256 xc:'#C15F3C' "$APPDIR/agent-buddy.png"
 else
-  base64 -d > "$APPDIR/claude-buddy.png" <<'PNG'
+  base64 -d > "$APPDIR/agent-buddy.png" <<'PNG'
 iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNgYGAAAAAEAAEnNCcKAAAAAElFTkSuQmCC
 PNG
 fi
@@ -74,12 +74,12 @@ fi
 cat > "$APPDIR/AppRun" <<'APPRUN'
 #!/bin/sh
 HERE="$(dirname "$(readlink -f "$0")")"
-exec "$HERE/usr/bin/claude-buddy-app" "$@"
+exec "$HERE/usr/bin/agent-buddy-app" "$@"
 APPRUN
 chmod +x "$APPDIR/AppRun"
 
 mkdir -p "$OUT"
-OUTFILE="$OUT/Claude-Buddy-$VERSION-x86_64.AppImage"
+OUTFILE="$OUT/Agent-Buddy-$VERSION-x86_64.AppImage"
 echo "==> building $OUTFILE"
 # --appimage-extract-and-run avoids needing FUSE in CI containers.
 ARCH=x86_64 appimagetool --appimage-extract-and-run "$APPDIR" "$OUTFILE"

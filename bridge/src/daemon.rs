@@ -1226,7 +1226,7 @@ fn spawn_keepalive(ev_tx: mpsc::Sender<Event>) {
     });
 }
 
-/// Periodically check GitHub for a newer claude-buddy release and feed the
+/// Periodically check GitHub for a newer agent-buddy release and feed the
 /// result to the owner loop (surfaced to the desktop app). The HTTP call shells
 /// out to `curl` and is blocking, so it runs on `spawn_blocking`. A failed check
 /// (offline, rate-limited) is logged at debug and simply skipped — the last good
@@ -1312,9 +1312,9 @@ fn acquire_singleton_lock() -> Result<SingletonLock> {
     // lets the service manager's KeepAlive/SuccessfulExit policy back off.
     let _ = last_err;
     info!(
-        "another claude-buddy daemon already holds the lock on {} — exiting cleanly; \
+        "another agent-buddy daemon already holds the lock on {} — exiting cleanly; \
          the running instance owns the buddy. To restart the service: \
-         `launchctl kickstart -k gui/$(id -u)/com.anthropic.claude-buddy`.",
+         `launchctl kickstart -k gui/$(id -u)/com.nateschnell.agent-buddy`.",
         path.display()
     );
     std::process::exit(0);

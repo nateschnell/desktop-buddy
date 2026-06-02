@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# Assemble a self-contained "Claude Buddy.app" and wrap it in a .dmg.
+# Assemble a self-contained "Agent Buddy.app" and wrap it in a .dmg.
 #
-# The .app carries BOTH binaries — the GUI (Contents/MacOS/claude-buddy-app, the
-# bundle's main executable) and the daemon (Contents/MacOS/claude-buddy, its
+# The .app carries BOTH binaries — the GUI (Contents/MacOS/agent-buddy-app, the
+# bundle's main executable) and the daemon (Contents/MacOS/agent-buddy, its
 # sibling) — plus every board's firmware image in Contents/Resources. That's the
 # layout the app's own self-install (setup.rs::install_desktop_launcher) expects:
 # the user double-clicks the app, it copies itself into /Applications, registers
@@ -13,10 +13,10 @@
 # Usage:
 #   make-app.sh --bin-dir DIR --fw-dir DIR --out DIR --version vX.Y.Z
 #
-#   --bin-dir   dir holding the (ideally universal) `claude-buddy` and
-#               `claude-buddy-app` binaries
+#   --bin-dir   dir holding the (ideally universal) `agent-buddy` and
+#               `agent-buddy-app` binaries
 #   --fw-dir    dir holding firmware*.bin / firmware*.version (optional)
-#   --out       output dir for "Claude Buddy.app" and the .dmg
+#   --out       output dir for "Agent Buddy.app" and the .dmg
 #   --version   version string baked into Info.plist + the dmg name
 #
 # Signing: ad-hoc by default. Set MACOS_SIGN_IDENTITY to a "Developer ID
@@ -37,8 +37,8 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$BIN_DIR" ] && [ -n "$OUT" ] || { echo "need --bin-dir and --out" >&2; exit 2; }
 
-GUI="$BIN_DIR/claude-buddy-app"
-DAEMON="$BIN_DIR/claude-buddy"
+GUI="$BIN_DIR/agent-buddy-app"
+DAEMON="$BIN_DIR/agent-buddy"
 [ -f "$GUI" ]    || { echo "missing GUI binary: $GUI" >&2; exit 1; }
 [ -f "$DAEMON" ] || { echo "missing daemon binary: $DAEMON" >&2; exit 1; }
 
@@ -48,14 +48,14 @@ DAEMON="$BIN_DIR/claude-buddy"
 SHORT="$(printf '%s' "$VERSION" | sed -E 's/^v//; s/-[0-9]+-g[0-9a-f]+$//; s/-dirty$//')"
 [ -n "$SHORT" ] || SHORT="0.0.0"
 
-APP="$OUT/Claude Buddy.app"
+APP="$OUT/Agent Buddy.app"
 CONTENTS="$APP/Contents"
 echo "==> assembling $APP (version $VERSION)"
 rm -rf "$APP"
 mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources"
 
-install -m 0755 "$GUI"    "$CONTENTS/MacOS/claude-buddy-app"
-install -m 0755 "$DAEMON" "$CONTENTS/MacOS/claude-buddy"
+install -m 0755 "$GUI"    "$CONTENTS/MacOS/agent-buddy-app"
+install -m 0755 "$DAEMON" "$CONTENTS/MacOS/agent-buddy"
 
 # Bring along every firmware image + version so the app's one-click OTA has an
 # image to flash for whichever board connects (see ota::bundled_firmware_path).
@@ -77,17 +77,17 @@ cat > "$CONTENTS/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>CFBundleName</key><string>Claude Buddy</string>
-  <key>CFBundleDisplayName</key><string>Claude Buddy</string>
-  <key>CFBundleIdentifier</key><string>com.anthropic.claude-buddy-app</string>
-  <key>CFBundleExecutable</key><string>claude-buddy-app</string>
+  <key>CFBundleName</key><string>Agent Buddy</string>
+  <key>CFBundleDisplayName</key><string>Agent Buddy</string>
+  <key>CFBundleIdentifier</key><string>com.nateschnell.agent-buddy-app</string>
+  <key>CFBundleExecutable</key><string>agent-buddy-app</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleVersion</key><string>$SHORT</string>
   <key>CFBundleShortVersionString</key><string>$SHORT</string>
   <key>LSMinimumSystemVersion</key><string>10.13</string>
   <key>NSHighResolutionCapable</key><true/>
-  <key>NSLocalNetworkUsageDescription</key><string>Claude Buddy flashes firmware updates to your buddy over your local Wi-Fi network.</string>
-  <key>NSBluetoothAlwaysUsageDescription</key><string>Claude Buddy connects to your hardware buddy over Bluetooth.</string>
+  <key>NSLocalNetworkUsageDescription</key><string>Agent Buddy flashes firmware updates to your buddy over your local Wi-Fi network.</string>
+  <key>NSBluetoothAlwaysUsageDescription</key><string>Agent Buddy connects to your hardware buddy over Bluetooth.</string>
 </dict></plist>
 PLIST
 
@@ -103,27 +103,27 @@ echo "==> codesigning (identity: $IDENTITY)"
 if [ "$IDENTITY" != "-" ]; then
   HARDENED=(--options runtime --timestamp)
   # Inner Mach-O binaries first (the sibling daemon), then the bundle itself —
-  # signing the bundle covers its main executable (claude-buddy-app).
+  # signing the bundle covers its main executable (agent-buddy-app).
   codesign --force "${HARDENED[@]}" --sign "$IDENTITY" \
-    "$CONTENTS/MacOS/claude-buddy"
+    "$CONTENTS/MacOS/agent-buddy"
   codesign --force "${HARDENED[@]}" --sign "$IDENTITY" \
-    --identifier com.anthropic.claude-buddy-app "$APP"
+    --identifier com.nateschnell.agent-buddy-app "$APP"
   codesign --verify --strict --verbose=2 "$APP"
 else
   codesign --force --deep --sign "$IDENTITY" \
-    --identifier com.anthropic.claude-buddy-app "$APP" || \
+    --identifier com.nateschnell.agent-buddy-app "$APP" || \
     echo "    (codesign failed; bundle still runs unsigned)" >&2
 fi
 
 # Build the .dmg. A plain read-only image of a folder containing the app + an
 # /Applications symlink is the conventional drag-to-install layout.
-DMG="$OUT/Claude-Buddy-$VERSION.dmg"
+DMG="$OUT/Agent-Buddy-$VERSION.dmg"
 echo "==> building $DMG"
 STAGE="$(mktemp -d)"
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
 rm -f "$DMG"
-hdiutil create -volname "Claude Buddy" -srcfolder "$STAGE" \
+hdiutil create -volname "Agent Buddy" -srcfolder "$STAGE" \
   -ov -format UDZO "$DMG" >/dev/null
 rm -rf "$STAGE"
 

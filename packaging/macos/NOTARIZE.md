@@ -1,6 +1,6 @@
 # macOS code signing + notarization
 
-How the `Claude Buddy.app` / `.dmg` is signed with a **Developer ID
+How the `Agent Buddy.app` / `.dmg` is signed with a **Developer ID
 Application** certificate and notarized by Apple so users can open it with no
 Gatekeeper prompt (and so the desktop app can eventually self-update — see
 `bridge/src/bin/app.rs` `update_card`).
@@ -44,9 +44,9 @@ MACOS_SIGN_IDENTITY="Developer ID Application: NAME (TEAMID)" \
     --version "$(git describe --tags --always --dirty)"
 
 # 3. Sanity-check the signature (before notarizing)
-codesign -dvvv "out/Claude Buddy.app"      # expect flags=…(runtime), Timestamp=…,
+codesign -dvvv "out/Agent Buddy.app"      # expect flags=…(runtime), Timestamp=…,
                                             # Authority chain ending in Apple Root CA
-codesign --verify --strict --verbose=2 "out/Claude Buddy.app"
+codesign --verify --strict --verbose=2 "out/Agent Buddy.app"
 
 # 4. Notarize the .dmg + staple the ticket
 DMG="$(ls out/*.dmg)"

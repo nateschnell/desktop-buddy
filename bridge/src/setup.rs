@@ -1,4 +1,4 @@
-//! `claude-buddy setup`: wire our hooks into Claude Code's settings and
+//! `agent-buddy setup`: wire our hooks into Claude Code's settings and
 //! install the daemon as a per-user background service. Idempotent.
 
 use anyhow::{anyhow, Context, Result};
@@ -20,13 +20,13 @@ const STATE_EVENTS: &[&str] = &[
 ];
 
 pub fn run(matcher: &str, install_service: bool) -> Result<()> {
-    let exe = std::env::current_exe().context("locating the claude-buddy binary")?;
+    let exe = std::env::current_exe().context("locating the agent-buddy binary")?;
     let exe_str = exe.to_string_lossy().to_string();
 
     // When installing the service, copy the daemon to its stable location up
     // front and point BOTH the Claude Code hooks and the service at that copy.
     // Otherwise the hooks reference wherever setup happened to run from — e.g.
-    // `target/release/claude-buddy`, which the next `cargo build` overwrites in
+    // `target/release/agent-buddy`, which the next `cargo build` overwrites in
     // place (breaking its code identity), or a path that later disappears.
     let hook_target = if install_service {
         install_daemon_binary(&exe_str).unwrap_or_else(|_| exe_str.clone())
@@ -59,12 +59,12 @@ pub fn run(matcher: &str, install_service: bool) -> Result<()> {
         print_manual_service_hint(&exe_str);
     }
 
-    println!("\nNext: power on your buddy, then run `claude-buddy pair` to confirm the link.");
+    println!("\nNext: power on your buddy, then run `agent-buddy pair` to confirm the link.");
     Ok(())
 }
 
 /// Merge our hook entries into `~/.claude/settings.json`, replacing any prior
-/// `claude-buddy` entries so re-running setup is safe.
+/// `agent-buddy` entries so re-running setup is safe.
 fn wire_hooks(path: &PathBuf, exe: &str, matcher: &str) -> Result<()> {
     let mut root: Value = match std::fs::read(path) {
         Ok(b) if !b.is_empty() => serde_json::from_slice(&b)
@@ -85,7 +85,7 @@ fn wire_hooks(path: &PathBuf, exe: &str, matcher: &str) -> Result<()> {
         .ok_or_else(|| anyhow!("`hooks` in settings.json is not an object"))?;
 
     // Quote the path: hook commands run through `/bin/sh`, and our install
-    // locations contain spaces (e.g. `…/Claude Buddy.app/…`, `…/Application
+    // locations contain spaces (e.g. `…/Agent Buddy.app/…`, `…/Application
     // Support/…`). Without quotes the shell splits the path mid-word.
     let q = shell_quote(exe);
 
@@ -124,7 +124,7 @@ fn wire_hooks(path: &PathBuf, exe: &str, matcher: &str) -> Result<()> {
     Ok(())
 }
 
-/// Replace any existing claude-buddy entry for `event` with `entry`, leaving
+/// Replace any existing agent-buddy entry for `event` with `entry`, leaving
 /// the user's other hooks for that event intact.
 fn set_event(hooks: &mut serde_json::Map<String, Value>, event: &str, entry: Value, exe: &str) {
     let arr = hooks.entry(event.to_string()).or_insert_with(|| json!([]));
@@ -137,10 +137,10 @@ fn set_event(hooks: &mut serde_json::Map<String, Value>, event: &str, entry: Val
 }
 
 /// True if a hook entry's command belongs to us (so we can replace it). Matches
-/// any invocation of the `claude-buddy` binary with a `hook` subcommand —
+/// any invocation of the `agent-buddy` binary with a `hook` subcommand —
 /// quoted or unquoted, at any install path — so re-running setup cleans up
 /// entries written by an earlier version (e.g. the old unquoted form) instead
-/// of leaving duplicates. A user hook that doesn't run `claude-buddy hook` is
+/// of leaving duplicates. A user hook that doesn't run `agent-buddy hook` is
 /// left untouched.
 fn is_ours(entry: &Value, _exe: &str) -> bool {
     entry
@@ -150,7 +150,7 @@ fn is_ours(entry: &Value, _exe: &str) -> bool {
             cmds.iter().any(|c| {
                 c.get("command")
                     .and_then(|v| v.as_str())
-                    .map(|s| s.contains("claude-buddy") && s.contains(" hook "))
+                    .map(|s| s.contains("agent-buddy") && s.contains(" hook "))
                     .unwrap_or(false)
             })
         })
@@ -180,10 +180,10 @@ fn install_daemon_service(exe: &str) -> Result<String> {
     let base = directories::BaseDirs::new().context("home dir")?;
     let dir = base.home_dir().join("Library/LaunchAgents");
     std::fs::create_dir_all(&dir)?;
-    let plist = dir.join("com.anthropic.claude-buddy.plist");
+    let plist = dir.join("com.nateschnell.agent-buddy.plist");
     let log = base
         .home_dir()
-        .join("Library/Logs/claude-buddy.log")
+        .join("Library/Logs/agent-buddy.log")
         .to_string_lossy()
         .into_owned();
     // KeepAlive stays unconditional (`<true/>`): a *conditional* KeepAlive that
@@ -197,7 +197,7 @@ fn install_daemon_service(exe: &str) -> Result<String> {
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>Label</key><string>com.anthropic.claude-buddy</string>
+  <key>Label</key><string>com.nateschnell.agent-buddy</string>
   <key>ProgramArguments</key><array><string>{exe}</string><string>daemon</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -238,7 +238,7 @@ fn install_daemon_service(exe: &str) -> Result<String> {
     let base = directories::BaseDirs::new().context("home dir")?;
     let dir = base.home_dir().join(".config/systemd/user");
     std::fs::create_dir_all(&dir)?;
-    let unit = dir.join("claude-buddy.service");
+    let unit = dir.join("agent-buddy.service");
     let body = format!(
         "[Unit]\nDescription=Claude buddy bridge daemon\n\n\
          [Service]\nExecStart={exe} daemon\nRestart=always\n\n\
@@ -246,7 +246,7 @@ fn install_daemon_service(exe: &str) -> Result<String> {
     );
     std::fs::write(&unit, body)?;
     Ok(format!(
-        "wrote systemd unit {}. Start it now with:\n    systemctl --user enable --now claude-buddy",
+        "wrote systemd unit {}. Start it now with:\n    systemctl --user enable --now agent-buddy",
         unit.display()
     ))
 }
@@ -291,13 +291,13 @@ fn print_manual_service_hint(exe: &str) {
 
 /// The macOS LaunchAgent label / plist basename and the Windows task name.
 #[cfg(target_os = "macos")]
-const MAC_LABEL: &str = "com.anthropic.claude-buddy";
+const MAC_LABEL: &str = "com.nateschnell.agent-buddy";
 /// Stable bundle identifier for the daemon helper .app. macOS keys the
 /// Bluetooth (TCC) grant to the code identity derived from this id + the
 /// ad-hoc signature, so it MUST stay constant across rebuilds or the user gets
 /// re-prompted (or silently denied) every time.
 #[cfg(target_os = "macos")]
-const MAC_DAEMON_BUNDLE_ID: &str = "com.anthropic.claude-buddy-helper";
+const MAC_DAEMON_BUNDLE_ID: &str = "com.nateschnell.agent-buddy-helper";
 
 /// Self-signed code-signing identity (created once by the user via
 /// `codesign`/Keychain) used to sign the helper + app bundles when present.
@@ -306,7 +306,7 @@ const MAC_DAEMON_BUNDLE_ID: &str = "com.anthropic.claude-buddy-helper";
 /// certificate-leaf-hash`), so the macOS Bluetooth / Local-Network (TCC) grants
 /// PERSIST instead of resetting every build. Falls back to ad-hoc if absent.
 #[cfg(target_os = "macos")]
-const MAC_SIGN_IDENTITY: &str = "Claude Buddy Dev";
+const MAC_SIGN_IDENTITY: &str = "Agent Buddy Dev";
 
 /// Codesign a bundle, preferring [`MAC_SIGN_IDENTITY`] and falling back to
 /// ad-hoc. Best-effort — an unsigned bundle still runs, it just re-prompts for
@@ -327,9 +327,9 @@ fn mac_codesign(bundle: &str, identifier: &str, deep: bool) {
 }
 
 #[cfg(target_os = "windows")]
-const WIN_TASK: &str = "ClaudeBuddy";
+const WIN_TASK: &str = "AgentBuddy";
 
-/// Locate the `claude-buddy` daemon binary to register as the service. Prefers
+/// Locate the `agent-buddy` daemon binary to register as the service. Prefers
 /// a copy sitting next to the currently-running executable (so the GUI, which
 /// ships beside the daemon, points the service at the bundled daemon), then
 /// falls back to the bare name on `PATH`.
@@ -337,9 +337,9 @@ pub fn daemon_exe_path() -> Result<String> {
     let here = std::env::current_exe().context("locating this executable")?;
     if let Some(dir) = here.parent() {
         let name = if cfg!(windows) {
-            "claude-buddy.exe"
+            "agent-buddy.exe"
         } else {
-            "claude-buddy"
+            "agent-buddy"
         };
         let candidate = dir.join(name);
         if candidate.exists() {
@@ -347,9 +347,9 @@ pub fn daemon_exe_path() -> Result<String> {
         }
     }
     Ok(if cfg!(windows) {
-        "claude-buddy.exe"
+        "agent-buddy.exe"
     } else {
-        "claude-buddy"
+        "agent-buddy"
     }
     .to_string())
 }
@@ -382,7 +382,7 @@ fn run_cmd(cmd: &str, args: &[&str]) -> Result<()> {
 /// and silently revoke its granted Bluetooth permission.
 ///
 /// On macOS the daemon lives inside a minimal `.app` bundle
-/// (`Claude Buddy Helper.app/Contents/MacOS/claude-buddy`) so its sibling
+/// (`Agent Buddy Helper.app/Contents/MacOS/agent-buddy`) so its sibling
 /// `Info.plist` can declare `NSBluetoothAlwaysUsageDescription` and a stable
 /// `CFBundleIdentifier`. The daemon — not the GUI — is the process that opens
 /// CoreBluetooth, so the TCC usage string and code identity must hang off *its*
@@ -391,20 +391,20 @@ fn run_cmd(cmd: &str, args: &[&str]) -> Result<()> {
 fn installed_daemon_path() -> Result<PathBuf> {
     let dirs = directories::BaseDirs::new().context("home dir")?;
     let name = if cfg!(windows) {
-        "claude-buddy.exe"
+        "agent-buddy.exe"
     } else {
-        "claude-buddy"
+        "agent-buddy"
     };
     Ok(dirs
         .data_local_dir()
-        .join("Claude Buddy")
+        .join("Agent Buddy")
         .join("bin")
         .join(name))
 }
 
 #[cfg(target_os = "macos")]
 fn installed_daemon_path() -> Result<PathBuf> {
-    Ok(mac_daemon_bundle()?.join("Contents/MacOS/claude-buddy"))
+    Ok(mac_daemon_bundle()?.join("Contents/MacOS/agent-buddy"))
 }
 
 /// The daemon helper `.app` bundle root.
@@ -413,8 +413,8 @@ fn mac_daemon_bundle() -> Result<PathBuf> {
     let dirs = directories::BaseDirs::new().context("home dir")?;
     Ok(dirs
         .data_local_dir()
-        .join("Claude Buddy")
-        .join("Claude Buddy Helper.app"))
+        .join("Agent Buddy")
+        .join("Agent Buddy Helper.app"))
 }
 
 /// Install an executable from `src` to `dest` via a same-directory temp file and
@@ -477,7 +477,7 @@ fn install_daemon_binary(src: &str) -> Result<String> {
     let macos_dir = contents.join("MacOS");
     std::fs::create_dir_all(&macos_dir)?;
 
-    let dest = macos_dir.join("claude-buddy");
+    let dest = macos_dir.join("agent-buddy");
     if !same_file(src, &dest) {
         install_binary(src, &dest)?;
     }
@@ -489,15 +489,15 @@ fn install_daemon_binary(src: &str) -> Result<String> {
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>CFBundleName</key><string>Claude Buddy Helper</string>
+  <key>CFBundleName</key><string>Agent Buddy Helper</string>
   <key>CFBundleIdentifier</key><string>{MAC_DAEMON_BUNDLE_ID}</string>
-  <key>CFBundleExecutable</key><string>claude-buddy</string>
+  <key>CFBundleExecutable</key><string>agent-buddy</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleVersion</key><string>{ver}</string>
   <key>CFBundleShortVersionString</key><string>{ver}</string>
   <key>LSMinimumSystemVersion</key><string>10.13</string>
   <key>LSBackgroundOnly</key><true/>
-  <key>NSBluetoothAlwaysUsageDescription</key><string>Claude Buddy connects to your buddy device over Bluetooth.</string>
+  <key>NSBluetoothAlwaysUsageDescription</key><string>Agent Buddy connects to your buddy device over Bluetooth.</string>
 </dict></plist>"#,
         ver = env!("CARGO_PKG_VERSION")
     );
@@ -595,20 +595,20 @@ fn mac_plist_path() -> Result<String> {
 #[cfg(target_os = "linux")]
 pub fn service_start() -> Result<String> {
     let _ = run_cmd("systemctl", &["--user", "daemon-reload"]);
-    run_cmd("systemctl", &["--user", "enable", "--now", "claude-buddy"])?;
+    run_cmd("systemctl", &["--user", "enable", "--now", "agent-buddy"])?;
     Ok("service started".into())
 }
 
 #[cfg(target_os = "linux")]
 pub fn service_restart() -> Result<String> {
     let _ = run_cmd("systemctl", &["--user", "daemon-reload"]);
-    run_cmd("systemctl", &["--user", "restart", "claude-buddy"])?;
+    run_cmd("systemctl", &["--user", "restart", "agent-buddy"])?;
     Ok("service restarted".into())
 }
 
 #[cfg(target_os = "linux")]
 pub fn service_stop() -> Result<String> {
-    run_cmd("systemctl", &["--user", "stop", "claude-buddy"])?;
+    run_cmd("systemctl", &["--user", "stop", "agent-buddy"])?;
     Ok("service stopped".into())
 }
 
@@ -623,7 +623,7 @@ pub fn service_restart() -> Result<String> {
     // End the current run (the logon task's own restart settings bring it back),
     // make sure the process is gone, then kick a fresh run immediately.
     let _ = run_cmd("schtasks", &["/End", "/TN", WIN_TASK]);
-    let _ = run_cmd("taskkill", &["/IM", "claude-buddy.exe", "/F"]);
+    let _ = run_cmd("taskkill", &["/IM", "agent-buddy.exe", "/F"]);
     run_cmd("schtasks", &["/Run", "/TN", WIN_TASK])?;
     Ok("service restarted".into())
 }
@@ -632,7 +632,7 @@ pub fn service_restart() -> Result<String> {
 pub fn service_stop() -> Result<String> {
     // End the scheduled run, then make sure the process is actually gone.
     let _ = run_cmd("schtasks", &["/End", "/TN", WIN_TASK]);
-    let _ = run_cmd("taskkill", &["/IM", "claude-buddy.exe", "/F"]);
+    let _ = run_cmd("taskkill", &["/IM", "agent-buddy.exe", "/F"]);
     Ok("service stopped".into())
 }
 
@@ -659,11 +659,11 @@ pub fn service_stop() -> Result<String> {
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "macos")]
-const MAC_APP_LABEL: &str = "com.anthropic.claude-buddy-app";
+const MAC_APP_LABEL: &str = "com.nateschnell.agent-buddy-app";
 #[cfg(target_os = "windows")]
-const WIN_APP_TASK: &str = "ClaudeBuddyApp";
+const WIN_APP_TASK: &str = "AgentBuddyApp";
 
-/// Locate the desktop app binary (`claude-buddy-app`) sitting next to this
+/// Locate the desktop app binary (`agent-buddy-app`) sitting next to this
 /// executable, if present. `None` means it isn't installed alongside, so the
 /// caller should skip wiring its login item.
 pub fn app_exe_path() -> Result<Option<String>> {
@@ -672,9 +672,9 @@ pub fn app_exe_path() -> Result<Option<String>> {
         .parent()
         .context("executable has no parent directory")?;
     let name = if cfg!(windows) {
-        "claude-buddy-app.exe"
+        "agent-buddy-app.exe"
     } else {
-        "claude-buddy-app"
+        "agent-buddy-app"
     };
     let cand = dir.join(name);
     Ok(cand.exists().then(|| cand.to_string_lossy().into_owned()))
@@ -769,12 +769,12 @@ pub fn register_desktop_app() -> Result<String> {
 pub fn install_desktop_launcher(app_exe: &str) -> Result<(String, String)> {
     // Prefer /Applications; fall back to ~/Applications if that isn't writable
     // (managed Macs) so the install still succeeds without sudo.
-    let probe = PathBuf::from("/Applications/Claude Buddy.app/Contents/MacOS");
+    let probe = PathBuf::from("/Applications/Agent Buddy.app/Contents/MacOS");
     let bundle = if std::fs::create_dir_all(&probe).is_ok() {
-        PathBuf::from("/Applications/Claude Buddy.app")
+        PathBuf::from("/Applications/Agent Buddy.app")
     } else {
         let base = directories::BaseDirs::new().context("home dir")?;
-        base.home_dir().join("Applications/Claude Buddy.app")
+        base.home_dir().join("Applications/Agent Buddy.app")
     };
     let contents = bundle.join("Contents");
     let macos_dir = contents.join("MacOS");
@@ -787,7 +787,7 @@ pub fn install_desktop_launcher(app_exe: &str) -> Result<(String, String)> {
     // (re-running setup from inside the installed bundle). Atomic-rename installs
     // avoid the AMFI "Killed: 9" that in-place overwrites of a registered bundle
     // binary trigger on Apple Silicon.
-    let dest_exe = macos_dir.join("claude-buddy-app");
+    let dest_exe = macos_dir.join("agent-buddy-app");
     if !same_file(app_exe, &dest_exe) {
         install_binary(app_exe, &dest_exe)?;
     }
@@ -798,8 +798,8 @@ pub fn install_desktop_launcher(app_exe: &str) -> Result<(String, String)> {
     // its own image (firmware-<board>.bin + .version) plus a legacy firmware.bin
     // (= CYD); copy them all verbatim — see ota::bundled_firmware_path.
     if let Some(src_dir) = std::path::Path::new(app_exe).parent() {
-        let daemon_src = src_dir.join("claude-buddy");
-        let daemon_dest = macos_dir.join("claude-buddy");
+        let daemon_src = src_dir.join("agent-buddy");
+        let daemon_dest = macos_dir.join("agent-buddy");
         if daemon_src.exists() && !same_file(&daemon_src.to_string_lossy(), &daemon_dest) {
             install_binary(&daemon_src.to_string_lossy(), &daemon_dest)?;
         }
@@ -822,16 +822,16 @@ pub fn install_desktop_launcher(app_exe: &str) -> Result<(String, String)> {
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>CFBundleName</key><string>Claude Buddy</string>
-  <key>CFBundleDisplayName</key><string>Claude Buddy</string>
-  <key>CFBundleIdentifier</key><string>com.anthropic.claude-buddy-app</string>
-  <key>CFBundleExecutable</key><string>claude-buddy-app</string>
+  <key>CFBundleName</key><string>Agent Buddy</string>
+  <key>CFBundleDisplayName</key><string>Agent Buddy</string>
+  <key>CFBundleIdentifier</key><string>com.nateschnell.agent-buddy-app</string>
+  <key>CFBundleExecutable</key><string>agent-buddy-app</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleVersion</key><string>{ver}</string>
   <key>CFBundleShortVersionString</key><string>{ver}</string>
   <key>LSMinimumSystemVersion</key><string>10.13</string>
   <key>NSHighResolutionCapable</key><true/>
-  <key>NSLocalNetworkUsageDescription</key><string>Claude Buddy flashes firmware updates to your buddy over your local Wi-Fi network.</string>
+  <key>NSLocalNetworkUsageDescription</key><string>Agent Buddy flashes firmware updates to your buddy over your local Wi-Fi network.</string>
 </dict></plist>"#,
         ver = env!("CARGO_PKG_VERSION")
     );
@@ -846,7 +846,7 @@ pub fn install_desktop_launcher(app_exe: &str) -> Result<(String, String)> {
     // Prefers the stable dev cert (Local-Network grant persists), else ad-hoc.
     mac_codesign(
         &bundle.to_string_lossy(),
-        "com.anthropic.claude-buddy-app",
+        "com.nateschnell.agent-buddy-app",
         true,
     );
 
@@ -873,10 +873,10 @@ pub fn install_desktop_launcher(app_exe: &str) -> Result<(String, String)> {
         .data_dir()
         .join(r"Microsoft\Windows\Start Menu\Programs");
     std::fs::create_dir_all(&programs)?;
-    let lnk = programs.join("Claude Buddy.lnk");
+    let lnk = programs.join("Agent Buddy.lnk");
     let script = format!(
         "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{lnk}');\
-         $s.TargetPath='{exe}';$s.Description='Claude Buddy';$s.Save()",
+         $s.TargetPath='{exe}';$s.Description='Agent Buddy';$s.Save()",
         lnk = lnk.display(),
         exe = app_exe,
     );
@@ -897,11 +897,11 @@ pub fn install_desktop_launcher(app_exe: &str) -> Result<(String, String)> {
     let base = directories::BaseDirs::new().context("home dir")?;
     let dir = base.home_dir().join(".local/share/applications");
     std::fs::create_dir_all(&dir)?;
-    let desktop = dir.join("claude-buddy.desktop");
+    let desktop = dir.join("agent-buddy.desktop");
     let body = format!(
         "[Desktop Entry]\n\
          Type=Application\n\
-         Name=Claude Buddy\n\
+         Name=Agent Buddy\n\
          Comment=Control panel for your Claude hardware buddy\n\
          Exec={app_exe}\n\
          Terminal=false\n\

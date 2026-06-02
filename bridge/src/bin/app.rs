@@ -1,4 +1,4 @@
-//! claude-buddy-app — the desktop control panel.
+//! agent-buddy-app — the desktop control panel.
 //!
 //! A small native window (eframe/egui) that drives the always-on daemon: it
 //! installs/starts the background service, shows live daemon + buddy status,
@@ -12,8 +12,8 @@
 
 #![cfg_attr(windows, windows_subsystem = "windows")] // no console window on Windows
 
-use claude_buddy::ipc::StatusReport;
-use claude_buddy::{client, ota, setup, state, update};
+use agent_buddy::ipc::StatusReport;
+use agent_buddy::{client, ota, setup, state, update};
 use eframe::egui;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread;
@@ -71,7 +71,7 @@ fn main() -> eframe::Result<()> {
     let _lock = match acquire_app_lock() {
         Ok(lock) => lock,
         Err(_) => {
-            eprintln!("Claude Buddy is already running.");
+            eprintln!("Agent Buddy is already running.");
             return Ok(());
         }
     };
@@ -80,7 +80,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([420.0, 700.0])
             .with_min_inner_size([360.0, 420.0])
-            .with_title("Claude Buddy"),
+            .with_title("Agent Buddy"),
         // Open at the coded size every launch, centered. eframe otherwise
         // persists the last window geometry to storage — which is why a changed
         // default looks like it "didn't take": the remembered size wins. A small
@@ -90,7 +90,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "Claude Buddy",
+        "Agent Buddy",
         options,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )
@@ -284,7 +284,7 @@ impl App {
             ui.vertical(|ui| {
                 ui.add_space(1.0);
                 ui.label(
-                    egui::RichText::new("Claude Buddy")
+                    egui::RichText::new("Agent Buddy")
                         .color(INK)
                         .size(21.0)
                         .strong(),
@@ -482,7 +482,7 @@ impl App {
         }
     }
 
-    /// "A newer Claude Buddy is out" banner. Renders only when the daemon's
+    /// "A newer Agent Buddy is out" banner. Renders only when the daemon's
     /// periodic check found a strictly-newer release. The action is a guided
     /// download (opens the GitHub release page) rather than an in-place
     /// self-update: replacing the running app bundle needs Developer ID signing +
@@ -507,7 +507,7 @@ impl App {
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new(format!(
-                    "Claude Buddy {latest} is out — you have v{current}."
+                    "Agent Buddy {latest} is out — you have v{current}."
                 ))
                 .color(MUTED)
                 .size(12.0),
@@ -789,15 +789,15 @@ fn init_tray(_ctx: &egui::Context) -> (Option<tray_icon::TrayIcon>, Option<Recei
 fn build_tray() -> Result<tray_icon::TrayIcon, Box<dyn std::error::Error>> {
     use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
     let menu = Menu::new();
-    menu.append(&MenuItem::with_id("open", "Open Claude Buddy", true, None))?;
+    menu.append(&MenuItem::with_id("open", "Open Agent Buddy", true, None))?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&MenuItem::with_id("start", "Start service", true, None))?;
     menu.append(&MenuItem::with_id("stop", "Stop service", true, None))?;
     menu.append(&PredefinedMenuItem::separator())?;
-    menu.append(&MenuItem::with_id("quit", "Quit Claude Buddy", true, None))?;
+    menu.append(&MenuItem::with_id("quit", "Quit Agent Buddy", true, None))?;
 
     let tray = tray_icon::TrayIconBuilder::new()
-        .with_tooltip("Claude Buddy")
+        .with_tooltip("Agent Buddy")
         .with_menu(Box::new(menu))
         .with_icon(tray_icon_image())
         .build()?;
@@ -886,7 +886,7 @@ fn spawn_worker(ctx: egui::Context, rx: Receiver<Cmd>, tx: Sender<Msg>) {
                                     Err(e) => (
                                         false,
                                         format!(
-                                            "{e}\nIf this keeps failing, allow “Claude Buddy” \
+                                            "{e}\nIf this keeps failing, allow “Agent Buddy” \
                                              under System Settings ▸ Privacy & Security ▸ \
                                              Local Network, then try again."
                                         ),
@@ -971,7 +971,7 @@ fn disconnected_hint(s: &StatusReport) -> String {
         return "Turn on Bluetooth on this Mac, then wait a moment.".into();
     }
     if s.bluetooth_permitted == Some(false) {
-        return "Allow Bluetooth for Claude Buddy in System Settings → Privacy & Security → Bluetooth."
+        return "Allow Bluetooth for Agent Buddy in System Settings → Privacy & Security → Bluetooth."
             .into();
     }
     if let Some(err) = &s.last_connect_error {
@@ -980,7 +980,7 @@ fn disconnected_hint(s: &StatusReport) -> String {
             return "Confirm the 6-digit code shown on your buddy to finish pairing.".into();
         }
         if low.contains("permission") || low.contains("denied") || low.contains("unauthorized") {
-            return "Allow Bluetooth for Claude Buddy in System Settings → Privacy & Security → Bluetooth."
+            return "Allow Bluetooth for Agent Buddy in System Settings → Privacy & Security → Bluetooth."
                 .into();
         }
         return format!("Last try: {err}. Power on your buddy and keep it nearby.");

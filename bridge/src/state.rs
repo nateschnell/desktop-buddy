@@ -8,11 +8,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Returns the per-user config/state directory, creating it if needed.
-/// macOS: ~/Library/Application Support/claude-buddy
-/// Linux: ~/.config/claude-buddy
-/// Windows: %APPDATA%\claude-buddy
+/// macOS: ~/Library/Application Support/agent-buddy
+/// Linux: ~/.config/agent-buddy
+/// Windows: %APPDATA%\agent-buddy
 pub fn config_dir() -> Result<PathBuf> {
-    let dirs = ProjectDirs::from("com", "anthropic", "claude-buddy")
+    let dirs = ProjectDirs::from("com", "anthropic", "agent-buddy")
         .context("could not determine a config directory")?;
     let dir = dirs.config_dir().to_path_buf();
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;

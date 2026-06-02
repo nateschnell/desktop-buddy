@@ -1,7 +1,7 @@
 //! Local IPC between the short-lived `hook` invocations and the long-running
 //! `daemon`.
 //!
-//! Claude Code spawns our `claude-buddy hook <event>` process on every hook
+//! Claude Code spawns our `agent-buddy hook <event>` process on every hook
 //! event. That process is too short-lived to own the BLE connection, so it
 //! connects to the already-running daemon over a loopback TCP socket and
 //! relays the event. For `PermissionRequest` it then blocks waiting for the
@@ -306,7 +306,7 @@ pub struct StatusReport {
     pub update: Option<UpdateStatus>,
 }
 
-/// A newer claude-buddy release the daemon found on GitHub, surfaced to the
+/// A newer agent-buddy release the daemon found on GitHub, surfaced to the
 /// desktop app's "update available" banner.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UpdateStatus {
