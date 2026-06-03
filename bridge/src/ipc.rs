@@ -304,18 +304,37 @@ pub struct StatusReport {
     /// failing, e.g. offline). Additive — old clients ignore it.
     #[serde(default)]
     pub update: Option<UpdateStatus>,
+    /// Newest firmware available from GitHub Releases for the *connected board*,
+    /// independent of the app's own version — so a device can be OTA-updated
+    /// without updating the desktop app. `None` until the first check completes,
+    /// no buddy is connected, or no release offers an image for the board. The
+    /// app compares its `version` to what the device reports (and to the image it
+    /// bundles) to decide whether to offer the update. Additive.
+    #[serde(default)]
+    pub firmware_latest: Option<FirmwareLatest>,
 }
 
 /// A newer agent-buddy release the daemon found on GitHub, surfaced to the
 /// desktop app's "update available" banner.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UpdateStatus {
-    /// The version this build is (`CARGO_PKG_VERSION`).
+    /// The version this build is (baked `AGENT_BUDDY_VERSION`).
     pub current: String,
     /// The latest published release tag (e.g. `"v0.1.2"`).
     pub latest: String,
     /// True when `latest` is strictly newer than `current`.
     pub available: bool,
     /// GitHub release page, for a guided download.
+    pub url: String,
+}
+
+/// The newest firmware image available from a GitHub release for a given board,
+/// surfaced so the app can offer (and download) an OTA update without shipping a
+/// new app build.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FirmwareLatest {
+    /// Clean firmware version, e.g. `"v0.1.4"` (any `fw-` routing prefix stripped).
+    pub version: String,
+    /// Direct download URL for the board's `firmware-<board>.bin` asset.
     pub url: String,
 }

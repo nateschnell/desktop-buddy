@@ -46,10 +46,11 @@ enum Cmd {
     /// link down and race the respawn.
     Restart,
     Stop,
-    /// Flash the bundled firmware to the buddy over the air (one-click update).
-    /// Carries the connected device's board id so the worker flashes the image
-    /// built for that board.
-    UpdateFirmware { board: String },
+    /// Flash firmware to the buddy over the air (one-click update). Carries the
+    /// connected device's board id (selects the image + OTA slot) and the source:
+    /// `url: Some` downloads that newer image from the GitHub release first;
+    /// `url: None` flashes the image bundled with this app.
+    UpdateFirmware { board: String, url: Option<String> },
 }
 
 /// A result from the worker thread back to the UI.
@@ -300,9 +301,11 @@ impl App {
     }
 
     fn status_card(&mut self, ui: &mut egui::Ui) {
-        // Set to the device's board id when an update button is clicked; the
-        // worker then flashes the image bundled for that board.
-        let mut want_update: Option<String> = None;
+        // Set when an update button is clicked: (board, source). source = `None`
+        // flashes the bundled image; `Some(url)` downloads that newer image from
+        // the GitHub release first. Consumed after the card closure (it borrows
+        // self), to issue the `UpdateFirmware` command.
+        let mut want_update: Option<(String, Option<String>)> = None;
         card(ui, |ui| {
             // While a firmware update is flashing, the buddy is "disconnected"
             // over BLE by design — so show progress here, above the normal
@@ -377,27 +380,50 @@ impl App {
                             }
                             None => metric_colored(ui, "Internet", "checking…", MUTED),
                         }
-                        // Over-the-air firmware update — needs Wi-Fi (ip known) and
-                        // a firmware image bundled with this app. We only push the
-                        // primary "update" button when the bundled image is
-                        // actually *newer* than what the buddy runs; otherwise we
-                        // either confirm it's current or, when the buddy didn't
-                        // report a comparable version, still allow a manual flash.
-                        // (Live progress renders at the top of the card, since the
-                        // buddy "disconnects" over BLE during the flash.)
+                        // Over-the-air firmware update — needs Wi-Fi (ip known).
+                        // The image can come from two places: the copy bundled
+                        // with this app, OR a newer one published to GitHub
+                        // Releases (downloaded at flash time, so a device can
+                        // update without the user updating the app). We pick the
+                        // newest available and only push the primary button when
+                        // it's actually newer than what the buddy runs; otherwise
+                        // confirm it's current, or — when the buddy didn't report a
+                        // comparable version — allow a manual flash. (Live progress
+                        // renders at the top of the card, since the buddy
+                        // "disconnects" over BLE during the flash.)
                         if self.ota_progress.is_none() {
-                            // Which board the buddy reports decides which bundled
-                            // image we compare against and flash. Older firmware
-                            // omits it → assume the default (CYD).
+                            // Which board the buddy reports decides the image +
+                            // OTA slot. Older firmware omits it → assume CYD.
                             let board = s
                                 .device_board
                                 .clone()
                                 .unwrap_or_else(|| ota::DEFAULT_BOARD.to_string());
-                            if let Some(bundled) = ota::bundled_firmware_version(&board) {
+                            // Best available image as (version, source): source
+                            // `None` = bundled, `Some(url)` = download from release.
+                            // Prefer bundled on a version tie (no needless download).
+                            let cand = |ver: Option<String>, url: Option<String>| {
+                                ver.and_then(|v| {
+                                    update::parse_version(&v).map(|pv| (pv, v, url))
+                                })
+                            };
+                            let bundled = cand(ota::bundled_firmware_version(&board), None);
+                            let release = cand(
+                                s.firmware_latest.as_ref().map(|f| f.version.clone()),
+                                s.firmware_latest.as_ref().map(|f| f.url.clone()),
+                            );
+                            let best = match (bundled, release) {
+                                (Some(b), Some(r)) => {
+                                    Some(if r.0 > b.0 { r } else { b })
+                                }
+                                (Some(b), None) => Some(b),
+                                (None, Some(r)) => Some(r),
+                                (None, None) => None,
+                            };
+                            if let Some((_, best_ver, best_url)) = best {
                                 let newer = s
                                     .device_fw
                                     .as_deref()
-                                    .map(|d| update::is_newer(&bundled, d))
+                                    .map(|d| update::is_newer(&best_ver, d))
                                     .unwrap_or(false);
                                 let device_known = s
                                     .device_fw
@@ -408,7 +434,7 @@ impl App {
                                 if newer {
                                     if primary_button(
                                         ui,
-                                        &format!("Update firmware → {bundled}"),
+                                        &format!("Update firmware → {best_ver}"),
                                         !self.busy,
                                     )
                                     .clicked()
@@ -416,7 +442,7 @@ impl App {
                                         // Deferred: `s` borrows self here, so we
                                         // can't self.send (mutable) until the card
                                         // closure returns.
-                                        want_update = Some(board.clone());
+                                        want_update = Some((board.clone(), best_url));
                                     }
                                 } else if device_known {
                                     // Buddy already runs this build (or newer) — a
@@ -427,8 +453,8 @@ impl App {
                                 {
                                     // Buddy didn't report a comparable version
                                     // (older firmware / dev build) — still let the
-                                    // user flash the bundled image by hand.
-                                    want_update = Some(board.clone());
+                                    // user flash the best image by hand.
+                                    want_update = Some((board.clone(), best_url));
                                 }
                             }
                         }
@@ -477,8 +503,8 @@ impl App {
                 }
             }
         });
-        if let Some(board) = want_update {
-            self.send(Cmd::UpdateFirmware { board });
+        if let Some((board, url)) = want_update {
+            self.send(Cmd::UpdateFirmware { board, url });
         }
     }
 
@@ -725,7 +751,9 @@ impl App {
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
-                    egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
+                    // Baked at build time (git describe / release tag), so this
+                    // already carries the leading "v" — don't prepend another.
+                    egui::RichText::new(env!("AGENT_BUDDY_VERSION"))
                         .color(MUTED)
                         .size(10.5),
                 );
@@ -869,36 +897,50 @@ fn spawn_worker(ctx: egui::Context, rx: Receiver<Cmd>, tx: Sender<Msg>) {
         loop {
             // Block for a command; on timeout, do a routine status refresh.
             match rx.recv_timeout(Duration::from_secs(2)) {
-                Ok(Cmd::UpdateFirmware { board }) => {
+                Ok(Cmd::UpdateFirmware { board, url }) => {
                     // Long-running with live progress, so it can't go through the
                     // one-shot `handle()`; stream OtaProgress, then the outcome.
-                    let action = match ota::bundled_firmware_path(&board) {
-                        Some(path) => match std::fs::read(&path) {
-                            Ok(bytes) => {
-                                let txp = tx.clone();
-                                match client::update_firmware(&bytes, &board, |pct| {
-                                    let _ = txp.send(Msg::OtaProgress(pct));
-                                    ctx.request_repaint();
-                                }) {
-                                    Ok(()) => {
-                                        (true, "firmware updated — buddy is rebooting".to_string())
-                                    }
-                                    Err(e) => (
-                                        false,
-                                        format!(
-                                            "{e}\nIf this keeps failing, allow “Agent Buddy” \
-                                             under System Settings ▸ Privacy & Security ▸ \
-                                             Local Network, then try again."
-                                        ),
-                                    ),
-                                }
+                    // Source the image: when a URL was chosen, download the newer
+                    // release image first (this is what lets a device update
+                    // without the user updating the app); otherwise read the copy
+                    // bundled with this app.
+                    let bytes: Result<Vec<u8>, String> = match &url {
+                        Some(u) => {
+                            // Show the progress panel immediately while we fetch.
+                            let _ = tx.send(Msg::OtaProgress(0));
+                            ctx.request_repaint();
+                            update::download_firmware(u)
+                                .map_err(|e| format!("couldn’t download firmware: {e}"))
+                        }
+                        None => match ota::bundled_firmware_path(&board) {
+                            Some(path) => std::fs::read(&path)
+                                .map_err(|e| format!("couldn’t read bundled firmware: {e}")),
+                            None => {
+                                Err("no firmware bundled with this app to install".to_string())
                             }
-                            Err(e) => (false, format!("couldn’t read bundled firmware: {e}")),
                         },
-                        None => (
-                            false,
-                            "no firmware bundled with this app to install".to_string(),
-                        ),
+                    };
+                    let action = match bytes {
+                        Ok(bytes) => {
+                            let txp = tx.clone();
+                            match client::update_firmware(&bytes, &board, |pct| {
+                                let _ = txp.send(Msg::OtaProgress(pct));
+                                ctx.request_repaint();
+                            }) {
+                                Ok(()) => {
+                                    (true, "firmware updated — buddy is rebooting".to_string())
+                                }
+                                Err(e) => (
+                                    false,
+                                    format!(
+                                        "{e}\nIf this keeps failing, allow “Agent Buddy” \
+                                         under System Settings ▸ Privacy & Security ▸ \
+                                         Local Network, then try again."
+                                    ),
+                                ),
+                            }
+                        }
+                        Err(e) => (false, e),
                     };
                     let _ = tx.send(Msg::Action(action.0, action.1));
                     let _ = tx.send(Msg::Status(client::status().map_err(|e| e.to_string())));

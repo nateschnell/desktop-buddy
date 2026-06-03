@@ -186,8 +186,9 @@ pub const DEFAULT_BOARD: &str = "cyd";
 /// releases ship `firmware-<board>.bin`; the plain `firmware.bin` (no suffix) is
 /// the legacy single image, which was always the CYD — so it's a fallback only
 /// for the CYD, never for another board (flashing a CYD image onto an ESP32-S3
-/// board would brick the flash).
-fn firmware_filenames(board: &str) -> Vec<String> {
+/// board would brick the flash). Shared with `update.rs` so the bundled-image
+/// lookup and the release-asset lookup agree on names (incl. the CYD legacy rule).
+pub(crate) fn firmware_filenames(board: &str) -> Vec<String> {
     let mut names = vec![format!("firmware-{board}.bin")];
     if board == DEFAULT_BOARD {
         names.push("firmware.bin".to_string());
@@ -217,9 +218,9 @@ pub fn bundled_firmware_path(board: &str) -> Option<std::path::PathBuf> {
 
 /// Version of the firmware image bundled for `board`. Read from a sibling
 /// `*.version` file matching the resolved image (`firmware-<board>.version` or
-/// the legacy `firmware.version`), falling back to the app's own version
-/// (`CARGO_PKG_VERSION`) — valid because one release tag builds both the app and
-/// the firmware it ships. Returns `None` only when no image is bundled for the
+/// the legacy `firmware.version`), falling back to the app's own baked version
+/// (`AGENT_BUDDY_VERSION`) — a reasonable guess only when a desktop release
+/// shipped both together. Returns `None` only when no image is bundled for the
 /// board, so the app can decide whether to offer an update. The string matches
 /// what the device reports (`git describe`, e.g. `"v0.1.0"`); compare with
 /// [`crate::update::is_newer`].
@@ -232,7 +233,7 @@ pub fn bundled_firmware_version(board: &str) -> Option<String> {
             return Some(s.to_string());
         }
     }
-    Some(env!("CARGO_PKG_VERSION").to_string())
+    Some(env!("AGENT_BUDDY_VERSION").to_string())
 }
 
 #[cfg(test)]

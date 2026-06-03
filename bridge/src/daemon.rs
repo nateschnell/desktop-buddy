@@ -7,8 +7,8 @@
 
 use crate::ble::BleLink;
 use crate::ipc::{
-    AdminRequest, AdminResponse, DeviceCommand, Endpoint, HookEvent, HookRequest, HookResponse,
-    Query, QueryRequest, QueryResponse, StatusReport, UpdateStatus, ENDPOINT_FILE,
+    AdminRequest, AdminResponse, DeviceCommand, Endpoint, FirmwareLatest, HookEvent, HookRequest,
+    HookResponse, Query, QueryRequest, QueryResponse, StatusReport, UpdateStatus, ENDPOINT_FILE,
 };
 use crate::protocol::{
     self, Decision, Heartbeat, Inbound, OutboundCmd, PromptPayload, TimeSync, MAX_LINE_BYTES,
@@ -16,7 +16,7 @@ use crate::protocol::{
 use crate::state::{config_dir, Config, SessionState};
 use anyhow::{Context, Result};
 use serde::Serialize;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -179,8 +179,12 @@ enum Event {
     Keepalive,
     /// A pending prompt outlived its TTL.
     PromptTimeout(String),
-    /// The background update checker found the latest release (or refreshed it).
-    UpdateInfo(UpdateStatus),
+    /// The background update checker refreshed release info: the app-update
+    /// status (desktop track) and the newest firmware per board (both tracks).
+    UpdateInfo {
+        app: UpdateStatus,
+        firmware: HashMap<String, FirmwareLatest>,
+    },
 }
 
 /// A Wi-Fi provisioning request whose IPC responder is parked until the device
@@ -286,6 +290,10 @@ pub async fn run(mock: Option<MockPolicy>) -> Result<()> {
     // Latest release the background checker found, if any. Surfaced in status so
     // the app can offer an update; refreshed every UPDATE_CHECK_INTERVAL.
     let mut latest_update: Option<UpdateStatus> = None;
+    // Newest firmware available per board (keyed by board id), independent of the
+    // app version. build_status picks the entry for the connected board so the
+    // app can offer an OTA without an app update. Refreshed on the same cadence.
+    let mut firmware_latest: HashMap<String, FirmwareLatest> = HashMap::new();
 
     info!("owner: {}", config.owner);
 
@@ -476,11 +484,12 @@ pub async fn run(mock: Option<MockPolicy>) -> Result<()> {
                     }
                 }
             }
-            Event::UpdateInfo(u) => {
-                if u.available {
-                    info!("update available: {} (current {})", u.latest, u.current);
+            Event::UpdateInfo { app, firmware } => {
+                if app.available {
+                    info!("app update available: {} (current {})", app.latest, app.current);
                 }
-                latest_update = Some(u);
+                latest_update = Some(app);
+                firmware_latest = firmware;
             }
             Event::Query(query, responder) => {
                 let resp = match query {
@@ -493,6 +502,7 @@ pub async fn run(mock: Option<MockPolicy>) -> Result<()> {
                         last_board.as_deref(),
                         last_connect_error.as_deref(),
                         latest_update.as_ref(),
+                        &firmware_latest,
                     )),
                 };
                 let _ = responder.send(resp);
@@ -513,6 +523,7 @@ fn build_status(
     last_board: Option<&str>,
     last_connect_error: Option<&str>,
     latest_update: Option<&UpdateStatus>,
+    firmware_latest: &HashMap<String, FirmwareLatest>,
 ) -> StatusReport {
     StatusReport {
         device_connected,
@@ -529,6 +540,15 @@ fn build_status(
         device_fw: last_fw.map(str::to_string),
         device_board: last_board.map(str::to_string),
         update: latest_update.cloned(),
+        // Firmware available for the connected board (older firmware that omits
+        // its board id is treated as the default). Only meaningful while linked.
+        firmware_latest: if device_connected {
+            firmware_latest
+                .get(last_board.unwrap_or(crate::ota::DEFAULT_BOARD))
+                .cloned()
+        } else {
+            None
+        },
         // Bluetooth availability/permission aren't directly observable from the
         // owner loop (the adapter handle lives in the BLE manager). We infer
         // from the latest connect error's classification instead: a clear
@@ -1120,96 +1140,142 @@ fn classify_connect_error(e: &anyhow::Error) -> String {
     }
 }
 
-/// Maintain the BLE connection: connect, forward lines, reconnect on drop.
-fn spawn_ble_manager(preferred: Option<String>, ev_tx: mpsc::Sender<Event>) {
-    tokio::spawn(async move {
-        // Same-lifetime reconnect should prefer the device we actually linked
-        // to. Seeded from config, then narrowed to the connected peripheral id
-        // after the first successful link (below).
-        let mut preferred = preferred;
-        let mut backoff = RECONNECT_BACKOFF_MIN;
-        loop {
-            match BleLink::connect(preferred.as_deref(), SCAN_SECS).await {
-                Ok((link, mut lines, connected_id)) => {
-                    backoff = RECONNECT_BACKOFF_MIN; // reset on success
-                                                     // Pin same-lifetime reconnects to the device we actually
-                                                     // linked to, so a returning buddy is matched directly
-                                                     // instead of re-running advertise discovery.
-                    preferred = Some(connected_id);
-                    // Keep macOS from idle-sleeping (and powering down the BT
-                    // radio) for the life of this connection, so the link
-                    // survives the screen going dark. Released automatically
-                    // when `_sleep_guard` drops as we leave this match arm on
-                    // disconnect. The display still sleeps normally.
-                    let _sleep_guard =
-                        crate::power::PowerAssertion::prevent_idle_sleep("Claude buddy connected");
-                    if ev_tx
-                        .send(Event::Connected(Link::Ble(link.clone())))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                    // Forward lines until the link drops. Detect a drop FAST:
-                    // race the line pump against a 2s liveness poll. On macOS a
-                    // dropped BLE link often leaves the notify channel open (no
-                    // clean `None`), so without the poll we'd wait the whole
-                    // LIVENESS_TIMEOUT — that was the ~15s recovery lag. is_connected()
-                    // reports the drop within ~2s; the silence deadline stays as the
-                    // backstop for a wedged-but-"connected" link.
-                    let mut last_line = std::time::Instant::now();
-                    loop {
-                        tokio::select! {
-                            r = lines.recv() => match r {
-                                Some(line) => {
-                                    last_line = std::time::Instant::now();
-                                    if ev_tx.send(Event::DeviceLine(line)).await.is_err() {
-                                        return;
-                                    }
+/// The BLE reconnect/forward loop: connect, forward lines, reconnect on drop.
+///
+/// Runs forever; it only returns when the owner channel is closed (the daemon
+/// is shutting down). It must never be spawned bare: a panic anywhere in here
+/// would end reconnection while the daemon keeps running and answering IPC,
+/// silently abandoning the device. [`spawn_ble_manager`] supervises it and
+/// respawns it on panic — keep them paired.
+async fn ble_manager_loop(mut preferred: Option<String>, ev_tx: mpsc::Sender<Event>) {
+    // Same-lifetime reconnect should prefer the device we actually linked to.
+    // Seeded from config, then narrowed to the connected peripheral id after
+    // the first successful link (below).
+    let mut backoff = RECONNECT_BACKOFF_MIN;
+    loop {
+        match BleLink::connect(preferred.as_deref(), SCAN_SECS).await {
+            Ok((link, mut lines, connected_id)) => {
+                backoff = RECONNECT_BACKOFF_MIN; // reset on success
+                                                 // Pin same-lifetime reconnects to the device we actually
+                                                 // linked to, so a returning buddy is matched directly
+                                                 // instead of re-running advertise discovery.
+                preferred = Some(connected_id);
+                // Keep macOS from idle-sleeping (and powering down the BT
+                // radio) for the life of this connection, so the link
+                // survives the screen going dark. Released automatically
+                // when `_sleep_guard` drops as we leave this match arm on
+                // disconnect. The display still sleeps normally.
+                let _sleep_guard =
+                    crate::power::PowerAssertion::prevent_idle_sleep("Claude buddy connected");
+                if ev_tx
+                    .send(Event::Connected(Link::Ble(link.clone())))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                // Forward lines until the link drops. Detect a drop FAST:
+                // race the line pump against a 2s liveness poll. On macOS a
+                // dropped BLE link often leaves the notify channel open (no
+                // clean `None`), so without the poll we'd wait the whole
+                // LIVENESS_TIMEOUT — that was the ~15s recovery lag. is_connected()
+                // reports the drop within ~2s; the silence deadline stays as the
+                // backstop for a wedged-but-"connected" link.
+                let mut last_line = std::time::Instant::now();
+                loop {
+                    tokio::select! {
+                        r = lines.recv() => match r {
+                            Some(line) => {
+                                last_line = std::time::Instant::now();
+                                if ev_tx.send(Event::DeviceLine(line)).await.is_err() {
+                                    return;
                                 }
-                                None => break, // pump closed: clean disconnect
-                            },
-                            _ = tokio::time::sleep(Duration::from_secs(2)) => {
-                                let gone = !matches!(
-                                    tokio::time::timeout(Duration::from_secs(2), link.is_connected()).await,
-                                    Ok(true)
+                            }
+                            None => break, // pump closed: clean disconnect
+                        },
+                        _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                            let gone = !matches!(
+                                tokio::time::timeout(Duration::from_secs(2), link.is_connected()).await,
+                                Ok(true)
+                            );
+                            if gone {
+                                warn!("link dropped — reconnecting");
+                                break;
+                            }
+                            if last_line.elapsed() >= LIVENESS_TIMEOUT {
+                                warn!(
+                                    "no device traffic in {}s — forcing reconnect",
+                                    LIVENESS_TIMEOUT.as_secs()
                                 );
-                                if gone {
-                                    warn!("link dropped — reconnecting");
-                                    break;
-                                }
-                                if last_line.elapsed() >= LIVENESS_TIMEOUT {
-                                    warn!(
-                                        "no device traffic in {}s — forcing reconnect",
-                                        LIVENESS_TIMEOUT.as_secs()
-                                    );
-                                    break;
-                                }
+                                break;
                             }
                         }
                     }
-                    // Best-effort cleanup, bounded: on a wedged macOS link the
-                    // disconnect ack rides the same dead event loop and never
-                    // returns, so we must not await it unbounded.
-                    let _ = tokio::time::timeout(Duration::from_secs(2), link.disconnect()).await;
-                    if ev_tx.send(Event::Disconnected).await.is_err() {
-                        return;
-                    }
                 }
-                Err(e) => {
-                    let reason = classify_connect_error(&e);
-                    debug!("connect attempt failed: {e}");
-                    // Surface the classified reason to the status UI. Ignore a
-                    // send failure (owner loop gone → we'll exit next iteration).
-                    let _ = ev_tx.send(Event::ConnectError(reason)).await;
+                // Best-effort cleanup, bounded: on a wedged macOS link the
+                // disconnect ack rides the same dead event loop and never
+                // returns, so we must not await it unbounded.
+                let _ = tokio::time::timeout(Duration::from_secs(2), link.disconnect()).await;
+                if ev_tx.send(Event::Disconnected).await.is_err() {
+                    return;
                 }
             }
-            // Keep retrying forever, but pace it: tight floor so a returning
-            // buddy is picked up within a scan window, growing to a cap so an
-            // absent buddy doesn't keep the radio hot. Reset to the floor on a
-            // successful connect (above).
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+            Err(e) => {
+                let reason = classify_connect_error(&e);
+                debug!("connect attempt failed: {e}");
+                // Surface the classified reason to the status UI. Ignore a
+                // send failure (owner loop gone → we'll exit next iteration).
+                let _ = ev_tx.send(Event::ConnectError(reason)).await;
+            }
+        }
+        // Keep retrying forever, but pace it: tight floor so a returning
+        // buddy is picked up within a scan window, growing to a cap so an
+        // absent buddy doesn't keep the radio hot. Reset to the floor on a
+        // successful connect (above).
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+    }
+}
+
+/// Maintain the BLE connection, supervised so it can never silently die.
+///
+/// The reconnect/forward logic ([`ble_manager_loop`]) runs in its own task. A
+/// panic in that path used to be unrecoverable: tokio kills only the panicking
+/// task, so the daemon stayed alive and answering IPC — looking healthy — while
+/// never reconnecting again until a full daemon restart. A powered device with
+/// nothing driving the link is exactly the "permanently abandoned" failure this
+/// project must avoid. Here we own the loop's [`JoinHandle`]: if it panics we
+/// log loudly and respawn after a short delay; a *clean* return means the owner
+/// channel is gone (daemon shutting down), so we stop.
+fn spawn_ble_manager(preferred: Option<String>, ev_tx: mpsc::Sender<Event>) {
+    tokio::spawn(async move {
+        loop {
+            // Re-seed `preferred` from the original each respawn: we lose the
+            // narrowed peripheral id, which just means one extra discovery pass
+            // — cheap, and far better than not reconnecting at all.
+            let task = tokio::spawn(ble_manager_loop(preferred.clone(), ev_tx.clone()));
+            match task.await {
+                Ok(()) => {
+                    // The loop only returns when an ev_tx send failed, i.e. the
+                    // owner loop is gone — the daemon is shutting down.
+                    debug!("BLE manager exited (owner gone) — not respawning");
+                    return;
+                }
+                Err(e) if e.is_panic() => {
+                    error!("BLE manager panicked ({e}) — respawning so reconnection continues");
+                }
+                Err(e) => {
+                    // Task cancelled (runtime shutting down). Nothing to recover.
+                    debug!("BLE manager task ended: {e}");
+                    return;
+                }
+            }
+            // Bounded delay so a panic-on-every-startup can't hot-loop the CPU.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            // If the owner is already gone, don't bother respawning.
+            if ev_tx.is_closed() {
+                return;
+            }
         }
     });
 }
@@ -1226,28 +1292,52 @@ fn spawn_keepalive(ev_tx: mpsc::Sender<Event>) {
     });
 }
 
-/// Periodically check GitHub for a newer agent-buddy release and feed the
-/// result to the owner loop (surfaced to the desktop app). The HTTP call shells
-/// out to `curl` and is blocking, so it runs on `spawn_blocking`. A failed check
-/// (offline, rate-limited) is logged at debug and simply skipped — the last good
-/// result, if any, stays in effect until the next success.
+/// Periodically check GitHub Releases and feed the result to the owner loop
+/// (surfaced to the desktop app). One call lists recent releases; from it we
+/// derive the app-update status (desktop `v*` track) AND the newest firmware per
+/// board (across both the `v*` and firmware-only `fw-v*` tracks) so a device can
+/// be OTA-updated independently of the app version. The HTTP call shells out to
+/// `curl` and is blocking, so it runs on `spawn_blocking`. A failed check
+/// (offline, rate-limited) is logged at debug and skipped — the last good result
+/// stays in effect until the next success.
 fn spawn_update_checker(ev_tx: mpsc::Sender<Event>) {
     tokio::spawn(async move {
         // Don't compete with startup: let the BLE connect + first heartbeat land
         // before doing network I/O, then check immediately and on a long cadence.
         tokio::time::sleep(Duration::from_secs(15)).await;
-        let current = env!("CARGO_PKG_VERSION").to_string();
+        let current = env!("AGENT_BUDDY_VERSION").to_string();
         loop {
-            match tokio::task::spawn_blocking(crate::update::latest_release).await {
-                Ok(Ok(rel)) => {
-                    let available = crate::update::is_newer(&rel.tag, &current);
-                    let info = UpdateStatus {
-                        current: current.clone(),
-                        latest: rel.tag,
-                        available,
-                        url: rel.url,
+            match tokio::task::spawn_blocking(crate::update::fetch_releases).await {
+                Ok(Ok(releases)) => {
+                    // App-update banner: newest desktop-track release, if any.
+                    let app = match crate::update::latest_app_release(&releases) {
+                        Some(rel) => UpdateStatus {
+                            current: current.clone(),
+                            available: crate::update::is_newer(&rel.tag, &current),
+                            latest: rel.tag.clone(),
+                            url: rel.url.clone(),
+                        },
+                        None => UpdateStatus {
+                            current: current.clone(),
+                            latest: current.clone(),
+                            available: false,
+                            url: String::new(),
+                        },
                     };
-                    if ev_tx.send(Event::UpdateInfo(info)).await.is_err() {
+                    // Newest firmware per board, version + download URL.
+                    let mut firmware: HashMap<String, FirmwareLatest> = HashMap::new();
+                    for board in crate::update::firmware_boards(&releases) {
+                        if let Some((version, url)) =
+                            crate::update::latest_firmware(&releases, &board)
+                        {
+                            firmware.insert(board, FirmwareLatest { version, url });
+                        }
+                    }
+                    if ev_tx
+                        .send(Event::UpdateInfo { app, firmware })
+                        .await
+                        .is_err()
+                    {
                         return; // owner loop gone
                     }
                 }

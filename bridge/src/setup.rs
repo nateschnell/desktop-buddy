@@ -254,24 +254,80 @@ fn install_daemon_service(exe: &str) -> Result<String> {
 #[cfg(target_os = "windows")]
 fn install_daemon_service(exe: &str) -> Result<String> {
     // Per-user logon-triggered Scheduled Task — the lightweight equivalent of a
-    // LaunchAgent / systemd user unit. No elevation, survives the GUI closing,
-    // restarts at next logon.
-    run_cmd(
-        "schtasks",
-        &[
-            "/Create",
-            "/F",
-            "/SC",
-            "ONLOGON",
-            "/TN",
-            WIN_TASK,
-            "/TR",
-            &format!("\"{exe}\" daemon"),
-        ],
-    )?;
+    // LaunchAgent / systemd user unit. No elevation, survives the GUI closing.
+    //
+    // We register it from an XML definition rather than the bare `/SC ONLOGON`
+    // form because the CLI flags can't express a restart policy: a plain logon
+    // task that crashes stays dead until the *next* logon (Windows has no
+    // launchd-style KeepAlive). The XML adds `RestartOnFailure` (retry on crash)
+    // and removes the default execution time limit (so the long-running daemon
+    // isn't killed after 72h), plus `IgnoreNew` so a second logon can't spawn a
+    // duplicate daemon fighting over the buddy's single BLE link (the singleton
+    // flock isn't enforced on Windows). If the XML create fails for any reason,
+    // fall back to the simple logon task so install never regresses.
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>Agent Buddy bridge daemon</Description></RegistrationInfo>
+  <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>
+  <Principals><Principal id="Author"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <Enabled>true</Enabled>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure>
+  </Settings>
+  <Actions Context="Author"><Exec><Command>{cmd}</Command><Arguments>daemon</Arguments></Exec></Actions>
+</Task>"#,
+        cmd = xml_escape(exe),
+    );
+
+    let xml_path = std::env::temp_dir().join("agent-buddy-task.xml");
+    let xml_path_str = xml_path.to_string_lossy().into_owned();
+    let from_xml = std::fs::write(&xml_path, xml.as_bytes())
+        .map_err(anyhow::Error::from)
+        .and_then(|_| {
+            run_cmd(
+                "schtasks",
+                &["/Create", "/F", "/TN", WIN_TASK, "/XML", &xml_path_str],
+            )
+        });
+    let _ = std::fs::remove_file(&xml_path);
+
+    if from_xml.is_err() {
+        // Fallback: the simple logon task. No crash-restart, but better than no
+        // service at all.
+        run_cmd(
+            "schtasks",
+            &[
+                "/Create",
+                "/F",
+                "/SC",
+                "ONLOGON",
+                "/TN",
+                WIN_TASK,
+                "/TR",
+                &format!("\"{exe}\" daemon"),
+            ],
+        )?;
+    }
     Ok(format!(
         "registered logon task {WIN_TASK}. Start it now with:\n    schtasks /Run /TN {WIN_TASK}"
     ))
+}
+
+/// Minimal XML text escaping for the exe path embedded in the task definition.
+#[cfg(target_os = "windows")]
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -485,6 +541,18 @@ fn install_daemon_binary(src: &str) -> Result<String> {
     // Sibling Info.plist carrying the Bluetooth usage string macOS shows in the
     // permission prompt, plus the stable bundle id the TCC grant keys to.
     // Central role only — NSBluetoothPeripheralUsageDescription is not needed.
+    //
+    // Activation policy is `LSUIElement`, NOT `LSBackgroundOnly`. This is load
+    // bearing for first-run Bluetooth: a background-only process is one macOS
+    // considers incapable of UI, so `tccd` *auto-denies* the Bluetooth request
+    // without ever prompting — the daemon then scans forever as "not permitted"
+    // and the device looks dead. `LSUIElement` is a UI-capable agent (no Dock
+    // icon, runs in the GUI launchd domain, which it does via `RunAtLoad`), so
+    // tccd presents the standard "Agent Buddy Helper would like to use
+    // Bluetooth" prompt the first time the daemon opens CoreBluetooth. The grant
+    // attaches to THIS bundle's code identity (the process that actually owns
+    // the radio), so the GUI app can't grant it by proxy — it has to be the
+    // helper. Once granted, the existing retry loop reconnects on the next pass.
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -496,7 +564,7 @@ fn install_daemon_binary(src: &str) -> Result<String> {
   <key>CFBundleVersion</key><string>{ver}</string>
   <key>CFBundleShortVersionString</key><string>{ver}</string>
   <key>LSMinimumSystemVersion</key><string>10.13</string>
-  <key>LSBackgroundOnly</key><true/>
+  <key>LSUIElement</key><true/>
   <key>NSBluetoothAlwaysUsageDescription</key><string>Agent Buddy connects to your buddy device over Bluetooth.</string>
 </dict></plist>"#,
         ver = env!("CARGO_PKG_VERSION")
@@ -596,7 +664,25 @@ fn mac_plist_path() -> Result<String> {
 pub fn service_start() -> Result<String> {
     let _ = run_cmd("systemctl", &["--user", "daemon-reload"]);
     run_cmd("systemctl", &["--user", "enable", "--now", "agent-buddy"])?;
-    Ok("service started".into())
+    // Enable lingering so the user's systemd instance (and thus this daemon)
+    // keeps running across logout and starts at boot before anyone logs in.
+    // Without it, `--user` units stop the moment the session ends — a powered
+    // buddy would then have nothing to connect to until the next login.
+    // Best-effort: enabling linger can require polkit authorization, and a
+    // failure here shouldn't fail an otherwise-successful install.
+    let user = std::env::var("USER").unwrap_or_default();
+    let lingered = if user.is_empty() {
+        run_cmd("loginctl", &["enable-linger"]).is_ok()
+    } else {
+        run_cmd("loginctl", &["enable-linger", &user]).is_ok()
+    };
+    Ok(if lingered {
+        "service started (lingering enabled — survives logout)".into()
+    } else {
+        "service started (note: enable lingering with `loginctl enable-linger` \
+         so the buddy stays reachable after you log out)"
+            .into()
+    })
 }
 
 #[cfg(target_os = "linux")]
