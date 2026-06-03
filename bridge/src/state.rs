@@ -34,6 +34,12 @@ pub struct Config {
     /// `YYYY-MM-DD` (local) the `tokens_today` counter belongs to.
     #[serde(default)]
     pub tokens_day: String,
+    /// Tool-name regex whose permission prompts route to the buddy, as chosen by
+    /// `setup --tools`. `None` = use the built-in default. Persisted so hook
+    /// reconciliation (daemon startup / app update) preserves a custom choice
+    /// instead of resetting it to the default.
+    #[serde(default)]
+    pub hook_matcher: Option<String>,
 }
 
 impl Default for Config {
@@ -47,6 +53,7 @@ impl Default for Config {
             preferred_device: None,
             tokens_today: 0,
             tokens_day: String::new(),
+            hook_matcher: None,
         }
     }
 }

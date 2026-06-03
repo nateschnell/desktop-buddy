@@ -44,6 +44,9 @@ enum Command {
         #[arg(long)]
         no_service: bool,
     },
+    /// Reverse `setup`: remove our hooks, the background daemon + service, the
+    /// desktop login item/launcher, and the per-user state. Best-effort.
+    Uninstall,
     /// Scan for a buddy, connect once, and report — for verifying setup.
     Pair,
     /// Show config and whether a daemon endpoint is published.
@@ -109,6 +112,10 @@ async fn async_main() -> Result<()> {
         }
         Command::Hook { event } => hook::run(&event).await,
         Command::Setup { tools, no_service } => setup::run(&tools, !no_service),
+        Command::Uninstall => {
+            println!("{}", setup::uninstall()?);
+            Ok(())
+        }
         Command::Pair => pair().await,
         Command::Status => status(),
         Command::Wifi { ssid, pass } => wifi(ssid, pass).await,

@@ -5,13 +5,32 @@
 #
 # Downloads the prebuilt binary, installs it, and wires it into Claude Code.
 #
-# Env overrides: AGENT_BUDDY_REPO, AGENT_BUDDY_VERSION, AGENT_BUDDY_NO_SETUP
+# Env overrides: AGENT_BUDDY_REPO, AGENT_BUDDY_VERSION, AGENT_BUDDY_NO_SETUP,
+#                AGENT_BUDDY_UNINSTALL=1 (remove everything)
 
 $ErrorActionPreference = 'Stop'
 
 $repo    = if ($env:AGENT_BUDDY_REPO)    { $env:AGENT_BUDDY_REPO }    else { 'nateschnell/agent-buddy' }
 $version = if ($env:AGENT_BUDDY_VERSION) { $env:AGENT_BUDDY_VERSION } else { 'latest' }
 $binDir  = Join-Path $env:LOCALAPPDATA 'agent-buddy'
+
+# --- uninstall mode --------------------------------------------------------
+# Reverse everything: the installed binary's own `uninstall` knows every
+# artifact (hooks, daemon, tasks, launcher, state); then remove the binary.
+if ($env:AGENT_BUDDY_UNINSTALL -eq '1') {
+  Write-Host "Uninstalling agent-buddy..." -ForegroundColor Cyan
+  $exe = Join-Path $binDir 'agent-buddy.exe'
+  if (Test-Path $exe) {
+    & $exe uninstall
+    Remove-Item (Join-Path $binDir 'agent-buddy.exe') -Force -ErrorAction SilentlyContinue
+    Remove-Item (Join-Path $binDir 'firmware*') -Force -ErrorAction SilentlyContinue
+    Write-Host "OK removed $exe" -ForegroundColor Green
+  } else {
+    Write-Host "  no agent-buddy.exe at $binDir - nothing to remove"
+  }
+  Write-Host "Done."
+  return
+}
 
 $arch = if ([Environment]::Is64BitOperatingSystem) {
   if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'aarch64' } else { 'x86_64' }

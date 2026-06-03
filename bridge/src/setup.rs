@@ -34,6 +34,16 @@ pub fn run(matcher: &str, install_service: bool) -> Result<()> {
         exe_str.clone()
     };
 
+    // Persist the chosen matcher so later reconciliation (daemon startup, app
+    // update) keeps it instead of reverting to the default. Only the explicit
+    // CLI path passes a custom `--tools`; everything else uses the default.
+    if let Ok(mut cfg) = crate::state::Config::load() {
+        if cfg.hook_matcher.as_deref() != Some(matcher) {
+            cfg.hook_matcher = Some(matcher.to_string());
+            let _ = cfg.save();
+        }
+    }
+
     let settings_path = claude_settings_path()?;
     wire_hooks(&settings_path, &hook_target, matcher)?;
     println!("✓ wired hooks into {}", settings_path.display());
@@ -63,9 +73,34 @@ pub fn run(matcher: &str, install_service: bool) -> Result<()> {
     Ok(())
 }
 
-/// Merge our hook entries into `~/.claude/settings.json`, replacing any prior
-/// `agent-buddy` entries so re-running setup is safe.
-fn wire_hooks(path: &PathBuf, exe: &str, matcher: &str) -> Result<()> {
+/// The canonical hook set we own, as `(event, optional-matcher)` pairs. Single
+/// source of truth for both wiring and reconciliation, so the two can't drift.
+/// `PermissionRequest` + `PreToolUse` are tool-gated (carry the matcher); the
+/// rest are bare state events.
+///
+/// - PermissionRequest: the matcher-scoped approve/deny gate. Claude raises it
+///   ONLY when it would actually prompt the user, so the device mirrors the
+///   real session's prompts — never auto-approved, allow-listed, bypass-mode,
+///   or autonomous subagent tool calls (all of which still fire PreToolUse).
+/// - PreToolUse: matcher-scoped telemetry heartbeat. Fires for every matched
+///   tool call so the device's token / context readout tracks the turn
+///   mid-flight instead of only jumping at Stop.
+fn hook_spec(matcher: &str) -> Vec<(&'static str, Option<String>)> {
+    let mut spec = vec![
+        ("PermissionRequest", Some(matcher.to_string())),
+        ("PreToolUse", Some(matcher.to_string())),
+    ];
+    spec.extend(STATE_EVENTS.iter().map(|ev| (*ev, None)));
+    spec
+}
+
+/// Reconcile our hook entries in `path` to *exactly* the canonical set for
+/// `exe` + `matcher`: strip every prior agent-buddy entry from every event
+/// (so events we no longer use, a renamed event, or a stale binary path are
+/// cleaned up — not just overwritten), then re-add the current set. The user's
+/// own hooks are always left untouched. Idempotent; returns whether the file
+/// actually changed (so callers can stay quiet on a no-op).
+fn wire_hooks(path: &PathBuf, exe: &str, matcher: &str) -> Result<bool> {
     let mut root: Value = match std::fs::read(path) {
         Ok(b) if !b.is_empty() => serde_json::from_slice(&b)
             .with_context(|| format!("parsing existing {}", path.display()))?,
@@ -74,6 +109,7 @@ fn wire_hooks(path: &PathBuf, exe: &str, matcher: &str) -> Result<()> {
     if !root.is_object() {
         return Err(anyhow!("{} is not a JSON object", path.display()));
     }
+    let before = root.clone();
 
     let hooks = root
         .as_object_mut()
@@ -84,56 +120,50 @@ fn wire_hooks(path: &PathBuf, exe: &str, matcher: &str) -> Result<()> {
         .as_object_mut()
         .ok_or_else(|| anyhow!("`hooks` in settings.json is not an object"))?;
 
-    // Quote the path: hook commands run through `/bin/sh`, and our install
-    // locations contain spaces (e.g. `…/Agent Buddy.app/…`, `…/Application
-    // Support/…`). Without quotes the shell splits the path mid-word.
-    let q = shell_quote(exe);
-
-    // PermissionRequest: the matcher-scoped approve/deny gate. Claude raises it
-    // ONLY when it would actually prompt the user, so the device mirrors the
-    // real session's prompts — never auto-approved, allow-listed, bypass-mode,
-    // or autonomous subagent tool calls (all of which still fire PreToolUse).
-    let permreq_entry = json!({
-        "matcher": matcher,
-        "hooks": [ { "type": "command", "command": format!("{q} hook PermissionRequest") } ]
-    });
-    set_event(hooks, "PermissionRequest", permreq_entry, exe);
-
-    // PreToolUse: matcher-scoped telemetry heartbeat. Fires for every matched
-    // tool call (it no longer gates) so the device's token / context readout
-    // tracks the turn mid-flight instead of only jumping at Stop.
-    let pretool_entry = json!({
-        "matcher": matcher,
-        "hooks": [ { "type": "command", "command": format!("{q} hook PreToolUse") } ]
-    });
-    set_event(hooks, "PreToolUse", pretool_entry, exe);
-
-    // State events: matcher-less command hooks.
-    for ev in STATE_EVENTS {
-        let entry = json!({
-            "hooks": [ { "type": "command", "command": format!("{q} hook {ev}") } ]
-        });
-        set_event(hooks, ev, entry, exe);
+    // 1) Strip ALL our prior entries from every event. This is what makes the
+    //    function a reconciler rather than an overwriter: an event we dropped in
+    //    a new version, or one whose command points at an old binary path, is
+    //    removed here instead of lingering.
+    for arr in hooks.values_mut() {
+        if let Some(a) = arr.as_array_mut() {
+            a.retain(|e| !is_ours(e, exe));
+        }
     }
 
+    // 2) Add the canonical set. Quote the path: hook commands run through a
+    //    shell, and our install locations contain spaces (e.g. `…/Agent
+    //    Buddy.app/…`, `…/Application Support/…`) — without quotes the shell
+    //    would split the path mid-word.
+    let q = shell_quote(exe);
+    for (event, m) in hook_spec(matcher) {
+        let cmd = format!("{q} hook {event}");
+        let entry = match m {
+            Some(m) => json!({ "matcher": m, "hooks": [ { "type": "command", "command": cmd } ] }),
+            None => json!({ "hooks": [ { "type": "command", "command": cmd } ] }),
+        };
+        hooks
+            .entry(event.to_string())
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .expect("event hook list is an array")
+            .push(entry);
+    }
+
+    // 3) Drop any event array we emptied out in step 1 (keeps the file tidy and
+    //    means a removed event leaves no orphan key behind).
+    hooks.retain(|_, v| v.as_array().map(|a| !a.is_empty()).unwrap_or(true));
+
+    // Nothing to write if our reconciliation was a no-op — avoids churning the
+    // file (and its mtime) on every daemon restart.
+    if root == before {
+        return Ok(false);
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
     std::fs::write(path, serde_json::to_vec_pretty(&root)?)
         .with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
-}
-
-/// Replace any existing agent-buddy entry for `event` with `entry`, leaving
-/// the user's other hooks for that event intact.
-fn set_event(hooks: &mut serde_json::Map<String, Value>, event: &str, entry: Value, exe: &str) {
-    let arr = hooks.entry(event.to_string()).or_insert_with(|| json!([]));
-    let Some(arr) = arr.as_array_mut() else {
-        *arr = json!([entry]);
-        return;
-    };
-    arr.retain(|e| !is_ours(e, exe));
-    arr.push(entry);
+    Ok(true)
 }
 
 /// True if a hook entry's command belongs to us (so we can replace it). Matches
@@ -168,6 +198,91 @@ fn shell_quote(s: &str) -> String {
 fn claude_settings_path() -> Result<PathBuf> {
     let base = directories::BaseDirs::new().context("could not find home directory")?;
     Ok(base.home_dir().join(".claude").join("settings.json"))
+}
+
+/// The tool matcher to wire, from the persisted config (set by `setup
+/// --tools`), falling back to the default. Reading it here is what lets
+/// reconciliation preserve a user's custom `--tools` choice instead of resetting
+/// it to the default on every daemon restart.
+fn configured_matcher() -> String {
+    crate::state::Config::load()
+        .ok()
+        .and_then(|c| c.hook_matcher)
+        .unwrap_or_else(|| DEFAULT_MATCHER.to_string())
+}
+
+/// Wire/reconcile the Claude Code hooks at the daemon's *stable* install path
+/// (the same location the service runs from), using the configured matcher. The
+/// desktop app's one-click install calls this right after installing the
+/// service, so a GUI install wires hooks exactly like `agent-buddy setup` /
+/// `install.sh` do — the install paths can't drift and leave the daemon running
+/// with nothing feeding it. Targets `~/.claude/settings.json` (user-global), so
+/// hooks apply across every Claude Code project. Returns the settings file.
+pub fn wire_claude_hooks() -> Result<PathBuf> {
+    let target = installed_daemon_path()?.to_string_lossy().into_owned();
+    let settings_path = claude_settings_path()?;
+    wire_hooks(&settings_path, &target, &configured_matcher())?;
+    Ok(settings_path)
+}
+
+/// Reconcile the Claude Code hooks to the canonical set for the *installed*
+/// daemon and the configured matcher. Run at daemon startup (and after an app
+/// update restarts it), this is the self-healing safety net: it repairs a
+/// half-finished install that never wired hooks, restores a hook a user deleted
+/// by hand, points a stale command at the current binary path, and adds/removes
+/// events when a new daemon version changes the set — all while leaving the
+/// user's own hooks untouched. Best-effort: the caller logs any error rather
+/// than failing on it. Returns whether anything changed.
+pub fn ensure_claude_hooks() -> Result<bool> {
+    let target = installed_daemon_path()?;
+    // Only reconcile when there's a real installed daemon to point hooks at.
+    // Without this guard a daemon run straight from a dev build (`cargo run`,
+    // no install) would rewrite the user's settings to invoke a binary that
+    // doesn't exist at the stable path. A genuine install always satisfies this
+    // (the service runs *from* that path).
+    if !target.exists() {
+        return Ok(false);
+    }
+    let settings_path = claude_settings_path()?;
+    wire_hooks(&settings_path, &target.to_string_lossy(), &configured_matcher())
+}
+
+/// Remove every agent-buddy hook entry from Claude Code's settings, leaving the
+/// user's own hooks in place. Used by `uninstall`. A missing, empty, or
+/// unparseable settings file is a no-op. Returns whether anything changed.
+pub fn strip_claude_hooks() -> Result<bool> {
+    strip_hooks_at(&claude_settings_path()?)
+}
+
+/// Strip our hooks from the settings file at `path` (split out so it's testable
+/// without touching the real `~/.claude/settings.json`).
+fn strip_hooks_at(path: &PathBuf) -> Result<bool> {
+    let mut root: Value = match std::fs::read(path) {
+        Ok(b) if !b.is_empty() => match serde_json::from_slice(&b) {
+            Ok(v) => v,
+            Err(_) => return Ok(false),
+        },
+        _ => return Ok(false),
+    };
+    let Some(obj) = root.as_object_mut() else {
+        return Ok(false);
+    };
+    let Some(hooks) = obj.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
+        return Ok(false);
+    };
+    let before = serde_json::to_string(hooks).unwrap_or_default();
+    for arr in hooks.values_mut() {
+        if let Some(a) = arr.as_array_mut() {
+            a.retain(|e| !is_ours(e, ""));
+        }
+    }
+    hooks.retain(|_, v| v.as_array().map(|a| !a.is_empty()).unwrap_or(true));
+    if serde_json::to_string(hooks).unwrap_or_default() == before {
+        return Ok(false);
+    }
+    std::fs::write(&path, serde_json::to_vec_pretty(&root)?)
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -515,6 +630,7 @@ fn install_daemon_binary(src: &str) -> Result<String> {
     if !same_file(src, &dest) {
         install_binary(src, &dest)?;
     }
+    let _ = write_daemon_version();
     Ok(dest.to_string_lossy().into_owned())
 }
 
@@ -576,7 +692,57 @@ fn install_daemon_binary(src: &str) -> Result<String> {
     // rebuilds), falls back to ad-hoc.
     mac_codesign(&bundle.to_string_lossy(), MAC_DAEMON_BUNDLE_ID, false);
 
+    // Stamp the version *after* signing — the sidecar lives outside the bundle
+    // (see `daemon_version_sidecar`), so writing it can't disturb the signature.
+    let _ = write_daemon_version();
     Ok(dest.to_string_lossy().into_owned())
+}
+
+/// This build's version, baked at compile time by `build.rs` from the release
+/// tag (`git describe` / `AGENT_BUDDY_VERSION`). The GUI and the daemon it ships
+/// share it, so it doubles as "the version of the daemon bundled with this app".
+pub fn current_version() -> &'static str {
+    env!("AGENT_BUDDY_VERSION")
+}
+
+/// Path of the sidecar recording the installed daemon's version. Sits *beside*
+/// the install, never inside the macOS bundle, so writing it can't break the
+/// bundle's code signature. Lets the GUI tell, on launch, whether the daemon it
+/// bundles is newer than the one installed — i.e. whether an app update needs to
+/// refresh the daemon too.
+fn daemon_version_sidecar() -> Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let parent = mac_daemon_bundle()?
+            .parent()
+            .context("daemon bundle has no parent")?
+            .to_path_buf();
+        Ok(parent.join("daemon.version"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let bin = installed_daemon_path()?;
+        let dir = bin.parent().context("installed daemon has no parent dir")?;
+        Ok(dir.join("daemon.version"))
+    }
+}
+
+/// Record [`current_version`] as the installed daemon's version. Best-effort.
+fn write_daemon_version() -> Result<()> {
+    let path = daemon_version_sidecar()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(&path, current_version())
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+/// The version recorded for the currently-installed daemon, if any. `None` when
+/// nothing is installed or the sidecar predates version tracking.
+pub fn installed_daemon_version() -> Option<String> {
+    let v = std::fs::read_to_string(daemon_version_sidecar().ok()?).ok()?;
+    let v = v.trim().to_string();
+    (!v.is_empty()).then_some(v)
 }
 
 /// Install the daemon as a background service AND start it now. Idempotent —
@@ -589,6 +755,43 @@ pub fn service_install_and_start(exe: &str) -> Result<String> {
     Ok(format!(
         "background service installed from {installed} and started"
     ))
+}
+
+/// Keep the installed daemon in lock-step with the app. If the daemon this app
+/// ships is newer than the one currently installed, re-stage it and restart the
+/// service — so an in-place app update also updates the background daemon (and,
+/// via the daemon's startup hook-reconciliation, its hooks). The GUI calls this
+/// once at launch.
+///
+/// No-op when: nothing is installed yet (first-time install goes through the
+/// explicit button), there's no daemon shipped beside this binary (a bare dev
+/// build), or the installed daemon is already current. Returns a note when it
+/// updated, `None` when it left things alone.
+pub fn refresh_daemon_if_outdated() -> Result<Option<String>> {
+    let installed_path = installed_daemon_path()?;
+    // Nothing installed → leave first-time install to the user's action.
+    if !installed_path.exists() {
+        return Ok(None);
+    }
+    let bundled = daemon_exe_path()?;
+    // No daemon shipped beside us, or we *are* the install (dev run) → nothing
+    // to refresh from.
+    if !std::path::Path::new(&bundled).exists() || same_file(&bundled, &installed_path) {
+        return Ok(None);
+    }
+    let current = current_version();
+    // Skip when the installed daemon is already as new (or newer). When the
+    // sidecar is missing/unparseable (a pre-tracking install), fall through and
+    // refresh once — which also stamps the sidecar for next time.
+    if let Some(installed) = installed_daemon_version() {
+        if !crate::update::is_newer(current, &installed) {
+            return Ok(None);
+        }
+    }
+    let dest = install_daemon_binary(&bundled)?;
+    install_daemon_service(&dest)?;
+    service_restart()?;
+    Ok(Some(format!("updated background daemon to {current}")))
 }
 
 /// Start the (already-installed) background service. Idempotent and gentle: if
@@ -1008,4 +1211,265 @@ pub fn install_desktop_launcher(_app_exe: &str) -> Result<(String, String)> {
     Err(anyhow!(
         "desktop launcher registration is unsupported on this platform"
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Uninstall — reverse everything install/setup created. Each step is
+// independent and best-effort: a failure (or an artifact that's already gone)
+// never blocks the rest, so a half-installed machine still ends up clean.
+// Drives the CLI `uninstall`, the desktop app's "Uninstall" action, and the
+// Windows installer's uninstall step.
+// ---------------------------------------------------------------------------
+
+/// Remove EVERYTHING this tool put on the machine: the Claude Code hooks, the
+/// background daemon + its service, the desktop app's login item and clickable
+/// launcher, and the per-user state dir. Best-effort — records a note per step
+/// and never aborts partway. Returns a human-readable multi-line summary.
+pub fn uninstall() -> Result<String> {
+    let mut notes: Vec<String> = Vec::new();
+    let mut note = |label: &str, r: Result<bool>| match r {
+        Ok(true) => notes.push(format!("✓ {label}")),
+        Ok(false) => notes.push(format!("· {label} (nothing to remove)")),
+        Err(e) => notes.push(format!("! {label}: {e}")),
+    };
+
+    // Stop the daemon + tear down its service first, so nothing respawns it
+    // while we remove its files and hooks.
+    note("background service", remove_daemon_service());
+    note("desktop app login item", remove_app_login_item());
+    note("Claude Code hooks", strip_claude_hooks());
+    note("daemon binary", remove_daemon_binary());
+    note("desktop launcher", remove_desktop_launcher());
+    note("per-user state", remove_state_dir());
+
+    Ok(format!("Uninstalled Agent Buddy:\n  {}", notes.join("\n  ")))
+}
+
+/// Remove the per-user config/state dir (config.json, endpoint.json, lock). On
+/// unix the running GUI's open lock fd survives the unlink; on Windows it may
+/// keep the file (the GUI isn't running during an installer-driven uninstall).
+fn remove_state_dir() -> Result<bool> {
+    // Compute the path WITHOUT `config_dir()`, which would re-create it.
+    let dir = directories::ProjectDirs::from("com", "anthropic", "agent-buddy")
+        .context("could not determine the state dir")?
+        .config_dir()
+        .to_path_buf();
+    if !dir.exists() {
+        return Ok(false);
+    }
+    std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
+    Ok(true)
+}
+
+#[cfg(target_os = "macos")]
+fn remove_daemon_service() -> Result<bool> {
+    let plist = mac_plist_path()?;
+    let existed = std::path::Path::new(&plist).exists();
+    let _ = run_cmd("launchctl", &["unload", "-w", &plist]);
+    if existed {
+        let _ = std::fs::remove_file(&plist);
+    }
+    Ok(existed)
+}
+
+#[cfg(target_os = "linux")]
+fn remove_daemon_service() -> Result<bool> {
+    let _ = run_cmd("systemctl", &["--user", "disable", "--now", "agent-buddy"]);
+    let base = directories::BaseDirs::new().context("home dir")?;
+    let unit = base
+        .home_dir()
+        .join(".config/systemd/user/agent-buddy.service");
+    let existed = unit.exists();
+    if existed {
+        let _ = std::fs::remove_file(&unit);
+    }
+    let _ = run_cmd("systemctl", &["--user", "daemon-reload"]);
+    Ok(existed)
+}
+
+#[cfg(target_os = "windows")]
+fn remove_daemon_service() -> Result<bool> {
+    let _ = run_cmd("schtasks", &["/End", "/TN", WIN_TASK]);
+    let _ = run_cmd("taskkill", &["/IM", "agent-buddy.exe", "/F"]);
+    Ok(run_cmd("schtasks", &["/Delete", "/F", "/TN", WIN_TASK]).is_ok())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn remove_daemon_service() -> Result<bool> {
+    Ok(false)
+}
+
+#[cfg(target_os = "macos")]
+fn remove_app_login_item() -> Result<bool> {
+    let base = directories::BaseDirs::new().context("home dir")?;
+    let plist = base
+        .home_dir()
+        .join("Library/LaunchAgents")
+        .join(format!("{MAC_APP_LABEL}.plist"));
+    let p = plist.to_string_lossy().into_owned();
+    let existed = plist.exists();
+    let _ = run_cmd("launchctl", &["unload", "-w", &p]);
+    if existed {
+        let _ = std::fs::remove_file(&plist);
+    }
+    Ok(existed)
+}
+
+#[cfg(target_os = "windows")]
+fn remove_app_login_item() -> Result<bool> {
+    Ok(run_cmd("schtasks", &["/Delete", "/F", "/TN", WIN_APP_TASK]).is_ok())
+}
+
+#[cfg(any(
+    target_os = "linux",
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows"))
+))]
+fn remove_app_login_item() -> Result<bool> {
+    // No login item is wired on Linux (autostart is left to the DE).
+    Ok(false)
+}
+
+#[cfg(target_os = "macos")]
+fn remove_daemon_binary() -> Result<bool> {
+    let mut removed = false;
+    let bundle = mac_daemon_bundle()?;
+    if bundle.exists() {
+        std::fs::remove_dir_all(&bundle)
+            .with_context(|| format!("removing {}", bundle.display()))?;
+        removed = true;
+    }
+    if let Ok(sidecar) = daemon_version_sidecar() {
+        if sidecar.exists() {
+            let _ = std::fs::remove_file(&sidecar);
+            removed = true;
+        }
+    }
+    Ok(removed)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn remove_daemon_binary() -> Result<bool> {
+    let mut removed = false;
+    let bin = installed_daemon_path()?;
+    if bin.exists() {
+        std::fs::remove_file(&bin).with_context(|| format!("removing {}", bin.display()))?;
+        removed = true;
+    }
+    if let Ok(sidecar) = daemon_version_sidecar() {
+        if sidecar.exists() {
+            let _ = std::fs::remove_file(&sidecar);
+            removed = true;
+        }
+    }
+    Ok(removed)
+}
+
+#[cfg(target_os = "macos")]
+fn remove_desktop_launcher() -> Result<bool> {
+    let mut removed = false;
+    let mut candidates = vec![PathBuf::from("/Applications/Agent Buddy.app")];
+    if let Some(base) = directories::BaseDirs::new() {
+        candidates.push(base.home_dir().join("Applications/Agent Buddy.app"));
+    }
+    for app in candidates {
+        // Deleting the bundle we're running from is safe on macOS — the open
+        // inode keeps the process alive until it exits.
+        if app.exists() && std::fs::remove_dir_all(&app).is_ok() {
+            removed = true;
+        }
+    }
+    Ok(removed)
+}
+
+#[cfg(target_os = "windows")]
+fn remove_desktop_launcher() -> Result<bool> {
+    let base = directories::BaseDirs::new().context("home dir")?;
+    let lnk = base
+        .data_dir()
+        .join(r"Microsoft\Windows\Start Menu\Programs")
+        .join("Agent Buddy.lnk");
+    let existed = lnk.exists();
+    if existed {
+        let _ = std::fs::remove_file(&lnk);
+    }
+    Ok(existed)
+}
+
+#[cfg(target_os = "linux")]
+fn remove_desktop_launcher() -> Result<bool> {
+    let base = directories::BaseDirs::new().context("home dir")?;
+    let dir = base.home_dir().join(".local/share/applications");
+    let desktop = dir.join("agent-buddy.desktop");
+    let existed = desktop.exists();
+    if existed {
+        let _ = std::fs::remove_file(&desktop);
+    }
+    let _ = run_cmd("update-desktop-database", &[&dir.to_string_lossy()]);
+    Ok(existed)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn remove_desktop_launcher() -> Result<bool> {
+    Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("ab-hooktest-{}-{name}.json", std::process::id()))
+    }
+
+    /// Wiring writes once, is a no-op the second time, and reconciles a changed
+    /// binary path to a single entry per event (no duplicates, new path).
+    #[test]
+    fn wire_is_idempotent_and_reconciles_path() {
+        let p = tmp("idem");
+        let _ = std::fs::remove_file(&p);
+        assert!(wire_hooks(&p, "/x/agent-buddy", "Bash").unwrap());
+        assert!(!wire_hooks(&p, "/x/agent-buddy", "Bash").unwrap());
+        assert!(wire_hooks(&p, "/y/agent-buddy", "Bash").unwrap());
+
+        let v: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        let hooks = v["hooks"].as_object().unwrap();
+        for ev in ["PermissionRequest", "PreToolUse", "SessionStart", "Stop"] {
+            let arr = hooks[ev].as_array().unwrap();
+            assert_eq!(
+                arr.iter().filter(|e| is_ours(e, "")).count(),
+                1,
+                "{ev} should have exactly one buddy entry"
+            );
+            let entry = arr.iter().find(|e| is_ours(e, "")).unwrap();
+            let cmd = entry["hooks"][0]["command"].as_str().unwrap();
+            assert!(cmd.contains("/y/agent-buddy"), "{ev} should use the new path");
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The user's own hooks survive both wiring and stripping; only ours move.
+    #[test]
+    fn wire_and_strip_preserve_user_hooks() {
+        let p = tmp("user");
+        std::fs::write(
+            &p,
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo hi"}]}]},"other":1}"#,
+        )
+        .unwrap();
+        wire_hooks(&p, "/x/agent-buddy", "Bash").unwrap();
+
+        let v: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        let stop = v["hooks"]["Stop"].as_array().unwrap();
+        assert!(stop.iter().any(|e| e["hooks"][0]["command"] == "echo hi"));
+        assert!(stop.iter().any(|e| is_ours(e, "")));
+        assert_eq!(v["other"], 1, "unrelated keys untouched");
+
+        assert!(strip_hooks_at(&p).unwrap());
+        let v: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        let stop = v["hooks"]["Stop"].as_array().unwrap();
+        assert!(stop.iter().any(|e| e["hooks"][0]["command"] == "echo hi"));
+        assert!(!stop.iter().any(|e| is_ours(e, "")), "ours are gone");
+        assert!(v["hooks"].get("PreToolUse").is_none(), "our-only events removed");
+        let _ = std::fs::remove_file(&p);
+    }
 }

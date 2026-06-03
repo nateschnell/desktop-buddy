@@ -12,6 +12,7 @@
 #   AGENT_BUDDY_VERSION release tag (default: latest)
 #   AGENT_BUDDY_BINDIR  install dir (default: ~/.local/bin)
 #   AGENT_BUDDY_NO_SETUP=1  install the binary only; skip `setup`
+#   AGENT_BUDDY_UNINSTALL=1 remove everything (hooks, daemon, service, state)
 set -eu
 
 REPO="${AGENT_BUDDY_REPO:-nateschnell/agent-buddy}"
@@ -20,6 +21,22 @@ BINDIR="${AGENT_BUDDY_BINDIR:-$HOME/.local/bin}"
 
 say()  { printf '\033[1m%s\033[0m\n' "$*"; }
 err()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# --- uninstall mode --------------------------------------------------------
+# Reverse everything: prefer the installed binary's own `uninstall` (it knows
+# every artifact); remove the binary + bundled firmware last.
+if [ "${AGENT_BUDDY_UNINSTALL:-0}" = "1" ]; then
+  say "Uninstalling agent-buddy…"
+  if [ -x "$BINDIR/agent-buddy" ]; then
+    "$BINDIR/agent-buddy" uninstall || true
+    rm -f "$BINDIR/agent-buddy" "$BINDIR"/firmware*.bin "$BINDIR"/firmware*.version
+    say "✓ removed $BINDIR/agent-buddy"
+  else
+    say "  no agent-buddy binary at $BINDIR — nothing to remove"
+  fi
+  say "Done."
+  exit 0
+fi
 
 # --- detect platform -> Rust target triple --------------------------------
 os="$(uname -s)"

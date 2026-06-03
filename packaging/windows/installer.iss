@@ -60,5 +60,11 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 Filename: "{app}\agent-buddy-app.exe"; Description: "Launch Agent Buddy"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
-; Tear down the logon task the app registered (best-effort; ignore if absent).
+; Full teardown via the daemon binary: removes the Claude Code hooks, the
+; installed daemon + its logon task, the app login task, the launcher, and the
+; per-user state. Runs before Inno removes {app}. Best-effort (ignore failure).
+Filename: "{app}\agent-buddy.exe"; Parameters: "uninstall"; Flags: runhidden; RunOnceId: "AgentBuddyUninstall"
+; Backstops: ensure both scheduled tasks are gone even if the call above
+; couldn't run (e.g. a damaged install).
 Filename: "{cmd}"; Parameters: "/c schtasks /Delete /F /TN AgentBuddy"; Flags: runhidden; RunOnceId: "DelTask"
+Filename: "{cmd}"; Parameters: "/c schtasks /Delete /F /TN AgentBuddyApp"; Flags: runhidden; RunOnceId: "DelAppTask"

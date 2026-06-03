@@ -232,6 +232,22 @@ pub async fn run(mock: Option<MockPolicy>) -> Result<()> {
     let mut config = Config::load()?;
     let mut state = SessionState::from_config(&config);
 
+    // --- Reconcile the Claude Code hooks. ---
+    // Bring our hook entries to exactly the canonical set for this installed
+    // daemon every time it starts. This is the self-healing safety net: it
+    // wires hooks an install never set up, restores one deleted by hand, repairs
+    // a stale binary path, and adds/removes events when a new daemon version
+    // changes the set — so a daemon restart (e.g. after an app update) is enough
+    // to converge. A no-op writes nothing. Skipped under a mock device so
+    // test/dev runs don't touch the user's real settings.json.
+    if mock.is_none() {
+        match crate::setup::ensure_claude_hooks() {
+            Ok(true) => info!("reconciled Claude Code hooks in settings.json"),
+            Ok(false) => {}
+            Err(e) => warn!("could not reconcile Claude Code hooks: {e}"),
+        }
+    }
+
     // --- IPC endpoint: bind loopback, publish {port, token} for hooks. ---
     let listener = TcpListener::bind("127.0.0.1:0")
         .await

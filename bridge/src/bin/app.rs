@@ -142,6 +142,14 @@ enum Cmd {
     /// `url: Some` downloads that newer image from the GitHub release first;
     /// `url: None` flashes the image bundled with this app.
     UpdateFirmware { board: String, url: Option<String> },
+    /// Run once at launch: if this app ships a newer gateway/daemon than the one
+    /// installed, re-stage it and restart the service (which then reconciles its
+    /// own hooks). Keeps the background daemon in lock-step with an in-place app
+    /// update. Silent when nothing needs doing.
+    Maintain,
+    /// Remove everything Agent Buddy installed (hooks, daemon, service, login
+    /// item, launcher, state) — the user-triggered counterpart to install.
+    Uninstall,
 }
 
 /// A result from the worker thread back to the UI.
@@ -261,6 +269,8 @@ struct App {
     tray: Option<tray_icon::TrayIcon>,
     /// Tray menu clicks, forwarded from the global event channel.
     tray_rx: Option<Receiver<TrayAction>>,
+    /// True while the "really uninstall?" confirmation is showing (Settings).
+    pending_uninstall: bool,
 }
 
 /// What a tray menu item does when clicked.
@@ -268,6 +278,7 @@ enum TrayAction {
     Open,
     Start,
     Stop,
+    Uninstall,
     Quit,
 }
 
@@ -277,6 +288,9 @@ impl App {
         let (tx_msg, rx) = std::sync::mpsc::channel::<Msg>();
         spawn_worker(cc.egui_ctx.clone(), rx_cmd, tx_msg);
         let _ = tx.send(Cmd::Refresh); // fetch immediately, don't wait for the tick
+        // Keep the installed gateway in lock-step with this app: if we ship a
+        // newer one, re-stage + restart it. Silent unless it actually updates.
+        let _ = tx.send(Cmd::Maintain);
 
         let (tray, tray_rx) = init_tray(&cc.egui_ctx);
 
@@ -297,6 +311,7 @@ impl App {
             show_pass: false,
             tray,
             tray_rx,
+            pending_uninstall: false,
         }
     }
 
@@ -953,6 +968,50 @@ impl App {
             }
         });
 
+        // Uninstall — removes everything Agent Buddy installed; gated behind an
+        // inline confirmation so the click is informed, not a trap.
+        ui.add_space(10.0);
+        card(ui, p, |ui| {
+            ui.label(
+                egui::RichText::new("Uninstall")
+                    .color(p.ink)
+                    .size(15.0)
+                    .strong(),
+            );
+            ui.add_space(6.0);
+            if self.pending_uninstall {
+                ui.label(
+                    egui::RichText::new(
+                        "Removes the Claude Code hooks, the background gateway and its \
+                         service, the login item, the app launcher, and saved settings. \
+                         Your buddy device and its firmware are not touched.",
+                    )
+                    .color(p.muted)
+                    .size(12.0),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if primary_button(ui, p, "Uninstall everything", !self.busy).clicked() {
+                        self.pending_uninstall = false;
+                        self.send(Cmd::Uninstall);
+                    }
+                    if ghost_button(ui, p, "Cancel", !self.busy).clicked() {
+                        self.pending_uninstall = false;
+                    }
+                });
+            } else {
+                ui.label(
+                    egui::RichText::new("Remove Agent Buddy and everything it installed.")
+                        .color(p.muted)
+                        .size(12.0),
+                );
+                ui.add_space(10.0);
+                if ghost_button(ui, p, "Uninstall Agent Buddy…", !self.busy).clicked() {
+                    self.pending_uninstall = true;
+                }
+            }
+        });
+
         self.action_feedback(ui, p);
     }
 
@@ -997,6 +1056,14 @@ impl App {
                 }
                 TrayAction::Start => self.send(Cmd::Start),
                 TrayAction::Stop => self.send(Cmd::Stop),
+                TrayAction::Uninstall => {
+                    // Surface the window on Settings with the confirmation up,
+                    // rather than tearing down from a menu click without warning.
+                    self.pending_uninstall = true;
+                    self.page = Page::Settings;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
                 TrayAction::Quit => std::process::exit(0),
             }
         }
@@ -1037,6 +1104,7 @@ fn build_tray() -> Result<tray_icon::TrayIcon, Box<dyn std::error::Error>> {
     menu.append(&MenuItem::with_id("start", "Start gateway", true, None))?;
     menu.append(&MenuItem::with_id("stop", "Stop gateway", true, None))?;
     menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&MenuItem::with_id("uninstall", "Uninstall Agent Buddy…", true, None))?;
     menu.append(&MenuItem::with_id("quit", "Quit Agent Buddy", true, None))?;
 
     let tray = tray_icon::TrayIconBuilder::new()
@@ -1059,6 +1127,7 @@ fn spawn_menu_pump(ctx: egui::Context) -> Receiver<TrayAction> {
                 "open" => TrayAction::Open,
                 "start" => TrayAction::Start,
                 "stop" => TrayAction::Stop,
+                "uninstall" => TrayAction::Uninstall,
                 "quit" => TrayAction::Quit,
                 _ => continue,
             };
@@ -1194,13 +1263,22 @@ fn handle(cmd: Cmd) -> Option<(bool, String)> {
         }),
         Cmd::InstallStart => Some(
             match setup::daemon_exe_path().and_then(|exe| setup::service_install_and_start(&exe)) {
-                // Gateway is the must-have; also register this GUI as a clickable
-                // desktop app so it can be reopened by hand. Best-effort — a failure
-                // here doesn't undo the gateway install.
-                Ok(note) => match setup::register_desktop_app() {
-                    Ok(app_note) => (true, format!("{note}; {app_note}")),
-                    Err(_) => (true, note),
-                },
+                // Gateway is the must-have. Then wire the Claude Code hooks:
+                // without them the daemon runs but never receives session/usage
+                // events, so the buddy shows nothing — the CLI `setup` wires them
+                // and a GUI install must match (surfaced, not best-effort).
+                // Finally register this GUI as a clickable desktop app
+                // (best-effort — a failure there doesn't undo the install).
+                Ok(note) => {
+                    let hooks = match setup::wire_claude_hooks() {
+                        Ok(p) => format!("; wired Claude Code hooks into {}", p.display()),
+                        Err(e) => format!("; ⚠ could not wire Claude Code hooks: {e}"),
+                    };
+                    let app = setup::register_desktop_app()
+                        .map(|n| format!("; {n}"))
+                        .unwrap_or_default();
+                    (true, format!("{note}{hooks}{app}"))
+                }
                 Err(e) => (false, e.to_string()),
             },
         ),
@@ -1214,6 +1292,19 @@ fn handle(cmd: Cmd) -> Option<(bool, String)> {
         }),
         Cmd::Stop => Some(match setup::service_stop() {
             Ok(note) => (true, note),
+            Err(e) => (false, e.to_string()),
+        }),
+        // Startup maintenance: only speak up if it actually updated the gateway;
+        // an up-to-date daemon (or a dev build) stays silent.
+        Cmd::Maintain => match setup::refresh_daemon_if_outdated() {
+            Ok(Some(note)) => Some((true, note)),
+            Ok(None) => None,
+            // Don't alarm at launch over a best-effort refresh; the daemon's own
+            // startup reconciliation is the backstop.
+            Err(_) => None,
+        },
+        Cmd::Uninstall => Some(match setup::uninstall() {
+            Ok(summary) => (true, format!("{summary}\n  Quit Agent Buddy to finish.")),
             Err(e) => (false, e.to_string()),
         }),
     }
