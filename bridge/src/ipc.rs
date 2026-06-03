@@ -326,6 +326,16 @@ pub struct UpdateStatus {
     pub available: bool,
     /// GitHub release page, for a guided download.
     pub url: String,
+    /// Direct download URL for this platform's in-place installer asset — macOS
+    /// `.dmg`, Windows `Setup.exe`, Linux `.AppImage`. `None` when the release
+    /// carries no package for this OS, in which case the app falls back to the
+    /// guided download at [`url`](Self::url). Selected by the OS the daemon (and
+    /// thus the app beside it) runs on.
+    #[serde(default)]
+    pub pkg_url: Option<String>,
+    /// File name of that installer asset (e.g. `"Agent-Buddy-v0.1.6.dmg"`).
+    #[serde(default)]
+    pub pkg_name: Option<String>,
 }
 
 /// The newest firmware image available from a GitHub release for a given board,

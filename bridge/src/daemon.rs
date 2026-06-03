@@ -1326,18 +1326,28 @@ fn spawn_update_checker(ev_tx: mpsc::Sender<Event>) {
             match tokio::task::spawn_blocking(crate::update::fetch_releases).await {
                 Ok(Ok(releases)) => {
                     // App-update banner: newest desktop-track release, if any.
+                    // Also surface this platform's installer asset (the `.dmg` /
+                    // `Setup.exe` / `.AppImage`) so the app can update in place
+                    // instead of only opening the release page.
                     let app = match crate::update::latest_app_release(&releases) {
-                        Some(rel) => UpdateStatus {
-                            current: current.clone(),
-                            available: crate::update::is_newer(&rel.tag, &current),
-                            latest: rel.tag.clone(),
-                            url: rel.url.clone(),
-                        },
+                        Some(rel) => {
+                            let pkg = crate::update::platform_package(rel);
+                            UpdateStatus {
+                                current: current.clone(),
+                                available: crate::update::is_newer(&rel.tag, &current),
+                                latest: rel.tag.clone(),
+                                url: rel.url.clone(),
+                                pkg_url: pkg.map(|a| a.url.clone()),
+                                pkg_name: pkg.map(|a| a.name.clone()),
+                            }
+                        }
                         None => UpdateStatus {
                             current: current.clone(),
                             latest: current.clone(),
                             available: false,
                             url: String::new(),
+                            pkg_url: None,
+                            pkg_name: None,
                         },
                     };
                     // Newest firmware per board, version + download URL.

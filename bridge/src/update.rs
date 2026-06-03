@@ -208,6 +208,58 @@ pub fn download_firmware(url: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// True when `name` is this platform's in-place installer asset: a macOS `.dmg`,
+/// a Windows `*Setup*.exe`, or a Linux `.AppImage`. Used to pick the right
+/// download off a release so the app can self-update without a browser.
+pub fn is_platform_package(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    #[cfg(target_os = "macos")]
+    {
+        n.ends_with(".dmg")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        n.ends_with(".exe") && n.contains("setup")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        n.ends_with(".appimage")
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        let _ = n;
+        false
+    }
+}
+
+/// The release's in-place installer asset for the current platform, if any.
+pub fn platform_package(rel: &Release) -> Option<&ReleaseAsset> {
+    rel.assets.iter().find(|a| is_platform_package(&a.name))
+}
+
+/// Download `url` straight to `dest` (curl follows GitHub's CDN redirect). For a
+/// desktop package (tens of MB) the timeout is generous. Blocking. The caller
+/// owns `dest` — typically a path in a temp dir it will clean up.
+pub fn download_to_file(url: &str, dest: &std::path::Path) -> Result<()> {
+    let dest_str = dest.to_str().context("non-UTF-8 download path")?;
+    curl(&[
+        "-fsSL",
+        "-L",
+        "--max-time",
+        "600",
+        "-H",
+        "User-Agent: agent-buddy",
+        "-o",
+        dest_str,
+        url,
+    ])?;
+    let len = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
+    if len == 0 {
+        return Err(anyhow!("the downloaded installer was empty"));
+    }
+    Ok(())
+}
+
 /// Parse a loose version string into a `(major, minor, patch)` triple. Tolerates
 /// a leading `v` and ignores any pre-release / build / git-describe suffix after
 /// the patch number — so `"v0.1.2"`, `"0.1.2"`, and `"v0.1.2-3-gdba2033-dirty"`
@@ -334,6 +386,23 @@ mod tests {
         let (ver, url) = latest_firmware(&rels, "fnk0104").expect("fnk firmware");
         assert_eq!(ver, "v0.1.4");
         assert_eq!(url, "https://dl/fnk-0.1.4.bin");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn platform_package_picks_the_dmg_on_macos() {
+        assert!(is_platform_package("Agent-Buddy-v0.1.6.dmg"));
+        assert!(!is_platform_package("agent-buddy-x86_64-apple-darwin.tar.gz"));
+
+        let rels = parse_releases(SAMPLE.as_bytes()).unwrap();
+        // The app release picks the .dmg over its sibling firmware assets.
+        let app = latest_app_release(&rels).expect("an app release");
+        let pkg = platform_package(app).expect("a macOS package");
+        assert_eq!(pkg.name, "Agent-Buddy-v0.1.3.dmg");
+        assert_eq!(pkg.url, "https://dl/app.dmg");
+        // A firmware-only release carries no desktop package.
+        let fw_only = rels.iter().find(|r| r.tag == "fw-v0.1.4").unwrap();
+        assert!(platform_package(fw_only).is_none());
     }
 
     #[test]

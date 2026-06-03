@@ -16,6 +16,7 @@ pub mod ipc;
 pub mod ota;
 pub mod power;
 pub mod protocol;
+pub mod selfupdate;
 pub mod setup;
 pub mod state;
 pub mod update;

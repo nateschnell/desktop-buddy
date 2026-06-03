@@ -19,7 +19,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")] // no console window on Windows
 
 use agent_buddy::ipc::StatusReport;
-use agent_buddy::{client, ota, setup, state, update};
+use agent_buddy::{client, ota, selfupdate, setup, state, update};
 use eframe::egui;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread;
@@ -142,6 +142,11 @@ enum Cmd {
     /// `url: Some` downloads that newer image from the GitHub release first;
     /// `url: None` flashes the image bundled with this app.
     UpdateFirmware { board: String, url: Option<String> },
+    /// Update *this app* in place: download the newer signed installer from the
+    /// release (`url` = the platform package's direct download), verify it, swap
+    /// the bundle, and relaunch. The worker exits the process on success — the
+    /// detached helper does the swap once we're gone. macOS only for now.
+    SelfUpdate { url: String },
     /// Run once at launch: if this app ships a newer gateway/daemon than the one
     /// installed, re-stage it and restart the service (which then reconciles its
     /// own hooks). Keeps the background daemon in lock-step with an in-place app
@@ -159,6 +164,9 @@ enum Msg {
     Action(bool, String),
     /// OTA transfer progress, 0..=100. Drives the update progress bar.
     OtaProgress(u8),
+    /// A short progress label for an in-place app self-update ("Downloading
+    /// update…", "Verifying signature…", …). Drives the install overlay.
+    UpdateStage(String),
 }
 
 fn main() -> eframe::Result<()> {
@@ -253,6 +261,9 @@ struct App {
     busy: bool,
     /// Live OTA transfer percentage while an update is in flight (`None` = idle).
     ota_progress: Option<u8>,
+    /// Current stage label while an in-place app self-update is running (`None` =
+    /// not updating). When set, the content pane shows a full install overlay.
+    update_stage: Option<String>,
     /// Which content page the nav rail has selected.
     page: Page,
     /// Light/dark/system preference, remembered across launches.
@@ -303,6 +314,7 @@ impl App {
             last_action: None,
             busy: false,
             ota_progress: None,
+            update_stage: None,
             page: Page::Overview,
             theme: load_theme_pref(),
             ssid_autofilled: detected_ssid.is_some(),
@@ -335,10 +347,17 @@ impl App {
                 Msg::Action(ok, text) => {
                     self.busy = false;
                     self.ota_progress = None;
+                    // A failed self-update reports here; clear the overlay so the
+                    // panel comes back. (A *successful* one never reaches this —
+                    // the worker exits the process to hand off to the swap helper.)
+                    self.update_stage = None;
                     self.last_action = Some((ok, text));
                 }
                 Msg::OtaProgress(pct) => {
                     self.ota_progress = Some(pct);
+                }
+                Msg::UpdateStage(s) => {
+                    self.update_stage = Some(s);
                 }
             }
         }
@@ -393,6 +412,12 @@ impl eframe::App for App {
                             .inner_margin(egui::Margin::symmetric(26.0, 20.0))
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
+                                // An in-flight in-place update owns the whole
+                                // pane — no navigating away mid-swap.
+                                if let Some(stage) = self.update_stage.clone() {
+                                    self.self_update_overlay(ui, &p, &stage);
+                                    return;
+                                }
                                 match self.page {
                                     Page::Overview => self.page_overview(ui, &p, status.as_ref()),
                                     Page::Wifi => self.page_wifi(ui, &p, status.as_ref()),
@@ -528,7 +553,120 @@ impl App {
 
 // --- pages ----------------------------------------------------------------
 impl App {
+    /// "A newer Agent Buddy is out" banner. When the release carries an installer
+    /// for this platform and in-place update is supported, the action is a
+    /// one-click **Update & restart** (download → verify → swap → relaunch);
+    /// otherwise it falls back to a guided download of the release page. Renders
+    /// nothing when no update is available or nothing is actionable.
+    fn update_banner(&mut self, ui: &mut egui::Ui, p: &Pal, st: Option<&StatusReport>) {
+        let Some(u) = st.and_then(|s| s.update.as_ref()).filter(|u| u.available) else {
+            return;
+        };
+        let latest = u.latest.clone();
+        let current = u.current.clone();
+        let page_url = u.url.clone();
+        // In-place only when we both have a platform installer URL and can do the
+        // swap on this OS; otherwise guided download (needs the release-page url).
+        let in_place = u
+            .pkg_url
+            .clone()
+            .filter(|_| selfupdate::supported());
+        if in_place.is_none() && page_url.is_empty() {
+            return; // nothing actionable
+        }
+        let busy = self.busy;
+        let mut want_self_update: Option<String> = None;
+
+        card(ui, p, |ui| {
+            ui.label(
+                egui::RichText::new("Update available")
+                    .color(p.accent)
+                    .size(15.0)
+                    .strong(),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(format!("Agent Buddy {latest} is out — you have v{current}."))
+                    .color(p.muted)
+                    .size(12.5),
+            );
+            ui.add_space(12.0);
+            if let Some(pkg_url) = in_place {
+                if primary_button(ui, p, &format!("Update & restart → {latest}"), !busy).clicked() {
+                    want_self_update = Some(pkg_url);
+                }
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Downloads, verifies, and installs automatically, then relaunches.",
+                    )
+                    .color(p.muted)
+                    .size(11.0),
+                );
+            } else {
+                #[cfg(target_os = "macos")]
+                {
+                    ui.label(
+                        egui::RichText::new(
+                            "Download it, then drag it into Applications to replace this version.",
+                        )
+                        .color(p.muted)
+                        .size(11.0),
+                    );
+                    ui.add_space(8.0);
+                }
+                if primary_button(ui, p, &format!("Download {latest}"), true).clicked() {
+                    open_url(&page_url);
+                }
+            }
+        });
+        if let Some(url) = want_self_update {
+            self.start_self_update(url);
+        }
+        ui.add_space(10.0);
+    }
+
+    /// Kick off an in-place self-update: show the overlay and hand the package
+    /// URL to the worker, which downloads, verifies, swaps, and relaunches.
+    fn start_self_update(&mut self, url: String) {
+        self.update_stage = Some("Starting update…".to_string());
+        self.send(Cmd::SelfUpdate { url });
+    }
+
+    /// Full-pane overlay shown while the app is replacing itself.
+    fn self_update_overlay(&mut self, ui: &mut egui::Ui, p: &Pal, stage: &str) {
+        ui.add_space(40.0);
+        card(ui, p, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(8.0);
+                ui.add(egui::Spinner::new().size(28.0).color(p.accent));
+                ui.add_space(14.0);
+                ui.label(
+                    egui::RichText::new("Updating Agent Buddy")
+                        .color(p.ink)
+                        .size(17.0)
+                        .strong(),
+                );
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(stage).color(p.muted).size(13.0));
+                ui.add_space(12.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Keep this window open — the app restarts itself when it’s done.",
+                    )
+                    .color(p.faint)
+                    .size(11.0),
+                );
+                ui.add_space(8.0);
+            });
+        });
+    }
+
     fn page_overview(&mut self, ui: &mut egui::Ui, p: &Pal, st: Option<&StatusReport>) {
+        // Lead with the app-update banner so a waiting update is the first thing
+        // seen (it renders nothing when none is available).
+        self.update_banner(ui, p, st);
+
         // A flashing firmware update owns the page — the buddy "disconnects" over
         // BLE during the flash, so nothing else here is meaningful meanwhile.
         if let Some(pct) = self.ota_progress {
@@ -907,48 +1045,10 @@ impl App {
             );
         });
 
-        // App update banner — only when the gateway's periodic check found a
-        // strictly-newer release. The action is a guided download (opens the
-        // release page) rather than an in-place self-update.
-        if let Some((latest, url, current)) = st.and_then(|s| {
-            s.update
-                .as_ref()
-                .filter(|u| u.available && !u.url.is_empty())
-                .map(|u| (u.latest.clone(), u.url.clone(), u.current.clone()))
-        }) {
-            ui.add_space(10.0);
-            card(ui, p, |ui| {
-                ui.label(
-                    egui::RichText::new("Update available")
-                        .color(p.accent)
-                        .size(15.0)
-                        .strong(),
-                );
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Agent Buddy {latest} is out — you have v{current}."
-                    ))
-                    .color(p.muted)
-                    .size(12.5),
-                );
-                #[cfg(target_os = "macos")]
-                {
-                    ui.add_space(2.0);
-                    ui.label(
-                        egui::RichText::new(
-                            "Download it, then drag it into Applications to replace this version.",
-                        )
-                        .color(p.muted)
-                        .size(11.0),
-                    );
-                }
-                ui.add_space(12.0);
-                if primary_button(ui, p, &format!("Download {latest}"), true).clicked() {
-                    open_url(&url);
-                }
-            });
-        }
+        // App update banner — one-click in-place update where supported, else a
+        // guided download. (Also shown at the top of Overview.)
+        ui.add_space(10.0);
+        self.update_banner(ui, p, st);
 
         // About.
         ui.add_space(10.0);
@@ -1181,6 +1281,32 @@ fn spawn_worker(ctx: egui::Context, rx: Receiver<Cmd>, tx: Sender<Msg>) {
         loop {
             // Block for a command; on timeout, do a routine status refresh.
             match rx.recv_timeout(Duration::from_secs(2)) {
+                Ok(Cmd::SelfUpdate { url }) => {
+                    // In-place app update: download → verify → swap → relaunch.
+                    // Streams stage labels for the overlay. On success the helper
+                    // is staged and waiting on our PID, so we exit(0) — a clean
+                    // exit keeps launchd from respawning the *old* bundle, letting
+                    // the helper swap it and reopen the new one.
+                    let txp = tx.clone();
+                    let ctxp = ctx.clone();
+                    match selfupdate::install_and_relaunch(&url, |s| {
+                        let _ = txp.send(Msg::UpdateStage(s.to_string()));
+                        ctxp.request_repaint();
+                    }) {
+                        Ok(()) => {
+                            let _ = tx.send(Msg::UpdateStage("Relaunching…".to_string()));
+                            ctx.request_repaint();
+                            // Give the overlay a beat to paint before we vanish.
+                            thread::sleep(Duration::from_millis(400));
+                            std::process::exit(0);
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Msg::Action(false, format!("update failed: {e}")));
+                            let _ =
+                                tx.send(Msg::Status(client::status().map_err(|e| e.to_string())));
+                        }
+                    }
+                }
                 Ok(Cmd::UpdateFirmware { board, url }) => {
                     // Long-running with live progress, so it can't go through the
                     // one-shot `handle()`; stream OtaProgress, then the outcome.
@@ -1253,6 +1379,7 @@ fn handle(cmd: Cmd) -> Option<(bool, String)> {
         Cmd::Refresh => None,
         // Handled directly in the worker loop (streams progress); never reaches here.
         Cmd::UpdateFirmware { .. } => None,
+        Cmd::SelfUpdate { .. } => None,
         Cmd::Provision { ssid, pass } => Some(match client::provision_wifi(&ssid, &pass) {
             // The gateway resolves Ok only after the device confirms it *stored*
             // the credentials, so this is "saved to the buddy", not merely sent.
