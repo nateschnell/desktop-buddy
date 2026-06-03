@@ -265,6 +265,12 @@ pub async fn run(mock: Option<MockPolicy>) -> Result<()> {
     spawn_ipc_accept(listener, token, ev_tx.clone());
     spawn_keepalive(ev_tx.clone());
     spawn_update_checker(ev_tx.clone());
+    // Recover the BLE link across system sleep/wake (lid close → reopen): on
+    // resume we restart so launchd hands us a fresh CoreBluetooth central. See
+    // the function doc for why an in-process central can't be recovered.
+    if mock.is_none() {
+        spawn_wake_watchdog();
+    }
 
     if let Some(policy) = mock {
         // Virtual device: "connect" immediately, auto-answer prompts.
@@ -1139,6 +1145,20 @@ async fn write_response<T: Serialize>(
 const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(2);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
+/// How often the wake watchdog ticks (monotonic). Each tick compares wall-clock
+/// advancement against this interval; a jump far past it means the machine slept
+/// and just resumed. See [`spawn_wake_watchdog`].
+const WAKE_TICK: Duration = Duration::from_secs(10);
+/// Wall-clock jump (over one [`WAKE_TICK`]) that we treat as a system resume.
+/// Comfortably above any scheduler jitter or small NTP step, well below the
+/// shortest realistic lid-close, so resumes are caught without false positives.
+const WAKE_GAP_THRESHOLD: Duration = Duration::from_secs(40);
+/// How long a *previously connected* link may stay un-regained before we assume
+/// the in-process CoreBluetooth central is wedged and restart for a fresh one.
+/// At ~72s per failed attempt (12s scan + 60s capped backoff) this is a few
+/// attempts. See the stall guard in [`ble_manager_loop`].
+const RECONNECT_STALL_LIMIT: Duration = Duration::from_secs(180);
+
 /// Classify a connect error into a short, user-facing reason for the status UI.
 /// String-based for now; when ble.rs grows typed error kinds (cross-bucket),
 /// this is the single place to switch on them instead.
@@ -1168,6 +1188,16 @@ async fn ble_manager_loop(mut preferred: Option<String>, ev_tx: mpsc::Sender<Eve
     // Seeded from config, then narrowed to the connected peripheral id after
     // the first successful link (below).
     let mut backoff = RECONNECT_BACKOFF_MIN;
+    // Set when a *previously good* link drops; the elapsed time since then is how
+    // long we've been unable to regain a link we know was reachable. If that
+    // outruns RECONNECT_STALL_LIMIT the in-process central is presumed wedged
+    // (the classic sleep/wake case the wake watchdog usually catches first, but
+    // also any cause it can't see — a brief sub-threshold sleep, a BT driver
+    // glitch) and we restart once for a fresh central. Re-stamped on each drop
+    // and never armed until we've connected at least once in THIS process — so a
+    // respawn that simply can't find an absent buddy keeps retrying forever
+    // instead of churning the process.
+    let mut stall_since: Option<std::time::Instant> = None;
     loop {
         match BleLink::connect(preferred.as_deref(), SCAN_SECS).await {
             Ok((link, mut lines, connected_id)) => {
@@ -1232,6 +1262,9 @@ async fn ble_manager_loop(mut preferred: Option<String>, ev_tx: mpsc::Sender<Eve
                 // disconnect ack rides the same dead event loop and never
                 // returns, so we must not await it unbounded.
                 let _ = tokio::time::timeout(Duration::from_secs(2), link.disconnect()).await;
+                // Start the stall clock: from here, failing to reconnect for
+                // RECONNECT_STALL_LIMIT means the central is likely wedged.
+                stall_since = Some(std::time::Instant::now());
                 if ev_tx.send(Event::Disconnected).await.is_err() {
                     return;
                 }
@@ -1239,6 +1272,22 @@ async fn ble_manager_loop(mut preferred: Option<String>, ev_tx: mpsc::Sender<Eve
             Err(e) => {
                 let reason = classify_connect_error(&e);
                 debug!("connect attempt failed: {e}");
+                // A link we know was reachable has stayed unreachable too long:
+                // the in-process CoreBluetooth central is presumed wedged (see
+                // spawn_wake_watchdog). Restart once for a fresh stack — launchd
+                // respawns us; the fresh instance won't re-arm this until it has
+                // connected, so an absent buddy can't make us churn.
+                if let Some(since) = stall_since {
+                    if since.elapsed() >= RECONNECT_STALL_LIMIT {
+                        warn!(
+                            "reconnect stalled {}s after a drop — restarting for a fresh \
+                             Bluetooth stack",
+                            since.elapsed().as_secs()
+                        );
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        std::process::exit(0);
+                    }
+                }
                 // Surface the classified reason to the status UI. Ignore a
                 // send failure (owner loop gone → we'll exit next iteration).
                 let _ = ev_tx.send(Event::ConnectError(reason)).await;
@@ -1303,6 +1352,58 @@ fn spawn_keepalive(ev_tx: mpsc::Sender<Event>) {
             tick.tick().await;
             if ev_tx.send(Event::Keepalive).await.is_err() {
                 return;
+            }
+        }
+    });
+}
+
+/// Detect a system sleep/wake transition and restart the process so the next
+/// instance comes up with a FRESH CoreBluetooth central.
+///
+/// Why restart rather than reconnect in place: when the lid closes, macOS
+/// sleeps, the Bluetooth radio powers down, and our BLE link drops. On wake the
+/// OS frequently *auto-restores* the ACL connection to the buddy at the system
+/// level — so the buddy sees itself "connected" and STOPS advertising — while
+/// our long-lived process's central is left wedged. It can neither see the
+/// (non-advertising) buddy in a scan nor recover by building a new
+/// `Manager`/`Adapter` in-process; verified in the field, it scans fruitlessly
+/// forever (the buddy meanwhile shows under `system_profiler`'s "Connected:").
+/// A brand-new *process* gets a clean central that immediately surfaces the
+/// already-connected peripheral and links in well under a second. The daemon is
+/// a launchd `KeepAlive` job, so exiting hands us straight back. This is the
+/// targeted fix for "closed the laptop, reopened, and it never reconnects".
+///
+/// Detection needs no OS power API, run loop, or entitlement: we compare
+/// wall-clock advancement against a monotonic tick. macOS suspends the monotonic
+/// clock (and our timers) while asleep, so the first tick after wake shows the
+/// wall clock having jumped far past the tick interval — an unmistakable resume
+/// signal. The same signature holds for suspend/resume on other platforms, so
+/// this stays unconditional. Display-only sleep keeps the process running (wall
+/// ≈ monotonic) and never trips it, and a live link is already gone by the time
+/// the system has slept, so a resume-restart never interrupts an active link.
+fn spawn_wake_watchdog() {
+    tokio::spawn(async move {
+        let mut last = std::time::SystemTime::now();
+        loop {
+            tokio::time::sleep(WAKE_TICK).await;
+            let now = std::time::SystemTime::now();
+            // `duration_since` errors only if the clock went backwards (e.g. an
+            // NTP step); treat that as "no jump" rather than a false resume.
+            let wall = now.duration_since(last).unwrap_or(Duration::ZERO);
+            last = now;
+            if wall >= WAKE_GAP_THRESHOLD {
+                warn!(
+                    "system resume detected (wall clock advanced {}s over a {}s tick) — \
+                     restarting for a fresh Bluetooth stack so the buddy reconnects",
+                    wall.as_secs(),
+                    WAKE_TICK.as_secs()
+                );
+                // Let the radio finish coming back so the respawned process's
+                // first scan lands on a ready adapter. launchd respawns us
+                // (KeepAlive); the OS releases our singleton lock + IPC socket
+                // on exit, and the fresh instance re-publishes its endpoint.
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                std::process::exit(0);
             }
         }
     });
