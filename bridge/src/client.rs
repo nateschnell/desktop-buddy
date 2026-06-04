@@ -101,6 +101,21 @@ pub fn status() -> Result<StatusReport> {
     }
 }
 
+/// Nudge the daemon to re-check GitHub for updates immediately instead of on its
+/// 6h cadence. Fire-and-forget from the UI's view: the fresh result arrives on a
+/// later `status()` poll, so we discard the (still-cached) snapshot it returns.
+pub fn recheck_updates() -> Result<()> {
+    let ep = endpoint()?;
+    let req = QueryRequest {
+        token: ep.token.clone(),
+        query: Query::RecheckUpdates,
+    };
+    match round_trip::<_, QueryResponse>(&ep, &req)? {
+        QueryResponse::Status(_) => Ok(()),
+        QueryResponse::Error { message } => Err(anyhow!(message)),
+    }
+}
+
 /// Push Wi-Fi credentials to the connected buddy via the daemon's BLE link.
 pub fn provision_wifi(ssid: &str, pass: &str) -> Result<()> {
     let ep = endpoint()?;

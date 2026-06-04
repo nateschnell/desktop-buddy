@@ -236,6 +236,12 @@ pub struct QueryRequest {
 pub enum Query {
     /// A full snapshot of daemon + device state.
     Status,
+    /// Nudge the daemon to re-check GitHub for updates *now* instead of waiting
+    /// for its periodic (6h) poll. The response carries the current snapshot;
+    /// the freshly-fetched result lands a moment later and surfaces on the next
+    /// `Status` poll. Lets the app show the newest release within seconds of
+    /// being opened rather than up to 6h stale.
+    RecheckUpdates,
 }
 
 /// Response daemon -> (GUI) for a [`QueryRequest`].

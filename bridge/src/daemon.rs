@@ -264,7 +264,11 @@ pub async fn run(mock: Option<MockPolicy>) -> Result<()> {
 
     spawn_ipc_accept(listener, token, ev_tx.clone());
     spawn_keepalive(ev_tx.clone());
-    spawn_update_checker(ev_tx.clone());
+    // Lets the owner loop nudge the update checker to poll immediately (on the
+    // app being opened) instead of only on its 6h cadence — the fix for a
+    // "latest available" banner that could lag reality by hours.
+    let update_recheck = std::sync::Arc::new(tokio::sync::Notify::new());
+    spawn_update_checker(ev_tx.clone(), update_recheck.clone());
     // Recover the BLE link across system sleep/wake (lid close → reopen): on
     // resume we restart so launchd hands us a fresh CoreBluetooth central. See
     // the function doc for why an in-process central can't be recovered.
@@ -514,8 +518,14 @@ pub async fn run(mock: Option<MockPolicy>) -> Result<()> {
                 firmware_latest = firmware;
             }
             Event::Query(query, responder) => {
+                // A recheck nudge re-arms the checker before we build the reply;
+                // the snapshot we return is still the cached one, but the fresh
+                // result lands within a second or two and shows on the next poll.
+                if matches!(query, Query::RecheckUpdates) {
+                    update_recheck.notify_one();
+                }
                 let resp = match query {
-                    Query::Status => QueryResponse::Status(build_status(
+                    Query::Status | Query::RecheckUpdates => QueryResponse::Status(build_status(
                         &config,
                         &state,
                         link.is_some(),
@@ -1417,7 +1427,10 @@ fn spawn_wake_watchdog() {
 /// `curl` and is blocking, so it runs on `spawn_blocking`. A failed check
 /// (offline, rate-limited) is logged at debug and skipped — the last good result
 /// stays in effect until the next success.
-fn spawn_update_checker(ev_tx: mpsc::Sender<Event>) {
+fn spawn_update_checker(
+    ev_tx: mpsc::Sender<Event>,
+    recheck: std::sync::Arc<tokio::sync::Notify>,
+) {
     tokio::spawn(async move {
         // Don't compete with startup: let the BLE connect + first heartbeat land
         // before doing network I/O, then check immediately and on a long cadence.
@@ -1471,7 +1484,13 @@ fn spawn_update_checker(ev_tx: mpsc::Sender<Event>) {
                 Ok(Err(e)) => debug!("update check failed: {e}"),
                 Err(e) => debug!("update check task panicked: {e}"),
             }
-            tokio::time::sleep(UPDATE_CHECK_INTERVAL).await;
+            // Wait for the periodic tick OR an on-demand nudge, whichever first.
+            // `Notify` holds one permit, so a nudge that arrives mid-fetch isn't
+            // lost — the next `notified()` returns at once (one extra poll).
+            tokio::select! {
+                _ = tokio::time::sleep(UPDATE_CHECK_INTERVAL) => {}
+                _ = recheck.notified() => debug!("on-demand update recheck"),
+            }
         }
     });
 }

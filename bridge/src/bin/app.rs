@@ -171,6 +171,12 @@ enum Page {
 /// A request from the UI to the worker thread.
 enum Cmd {
     Refresh,
+    /// Nudge the daemon to re-check GitHub for the newest release right now,
+    /// rather than waiting out its 6h poll. Fired at launch and whenever the
+    /// window regains focus, so the "update available" / firmware banners always
+    /// reflect the latest within seconds of the user looking — produces no
+    /// `Action`, the result lands on the next routine status poll.
+    RecheckUpdates,
     Provision {
         ssid: String,
         pass: String,
@@ -330,6 +336,12 @@ struct App {
     tray_rx: Option<Receiver<TrayAction>>,
     /// True while the "really uninstall?" confirmation is showing (Settings).
     pending_uninstall: bool,
+    /// Whether the window held OS focus on the previous frame. A `false → true`
+    /// transition (the user returning to the app) triggers an update recheck.
+    was_focused: bool,
+    /// When we last asked the daemon to re-poll for updates — throttles the
+    /// focus-driven recheck so rapid focus flapping can't hammer GitHub.
+    last_update_recheck: Option<Instant>,
 }
 
 /// What a tray menu item does when clicked.
@@ -350,6 +362,9 @@ impl App {
         let (tx_msg, rx) = std::sync::mpsc::channel::<Msg>();
         spawn_worker(cc.egui_ctx.clone(), rx_cmd, tx_msg);
         let _ = tx.send(Cmd::Refresh); // fetch immediately, don't wait for the tick
+        // Ask the daemon to re-poll GitHub now so the update banners reflect the
+        // newest release at launch, not its last (≤6h-old) cached check.
+        let _ = tx.send(Cmd::RecheckUpdates);
         // Keep the installed gateway in lock-step with this app: if we ship a
         // newer one, re-stage + restart it. Silent unless it actually updates.
         let _ = tx.send(Cmd::Maintain);
@@ -376,6 +391,8 @@ impl App {
             tray,
             tray_rx,
             pending_uninstall: false,
+            was_focused: true,
+            last_update_recheck: Some(Instant::now()),
         }
     }
 
@@ -396,6 +413,19 @@ impl App {
     /// that clears `busy`; bare refreshes must not.
     fn refresh(&self) {
         let _ = self.tx.send(Cmd::Refresh);
+    }
+
+    /// Ask the daemon to re-poll GitHub for updates, but at most once per 30s so
+    /// repeated focus changes don't hammer the network. Like `refresh`, this
+    /// stays off the `busy` path — it's a background nudge, not a user action.
+    fn recheck_updates_throttled(&mut self) {
+        let due = self
+            .last_update_recheck
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(30));
+        if due {
+            self.last_update_recheck = Some(Instant::now());
+            let _ = self.tx.send(Cmd::RecheckUpdates);
+        }
     }
 
     /// Switch pages, clearing any transient feedback so a result from one page
@@ -457,6 +487,15 @@ impl eframe::App for App {
         self.handle_tray(ctx);
         // Keep the status ticking even if the user is idle.
         ctx.request_repaint_after(Duration::from_secs(2));
+
+        // When the user comes back to the window, re-poll for updates so the
+        // banners reflect the newest release rather than the daemon's last
+        // cached check. Throttled, so focus flapping can't spam GitHub.
+        let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+        if focused && !self.was_focused {
+            self.recheck_updates_throttled();
+        }
+        self.was_focused = focused;
 
         let sys_dark = frame.info().system_theme == Some(eframe::Theme::Dark);
         let dark = self.effective_dark(sys_dark);
@@ -1458,6 +1497,13 @@ fn spawn_worker(ctx: egui::Context, rx: Receiver<Cmd>, tx: Sender<Msg>) {
 fn handle(cmd: Cmd) -> Option<(bool, String)> {
     match cmd {
         Cmd::Refresh => None,
+        // Background nudge: ask the daemon to re-poll GitHub now. No outcome to
+        // report; the worker's follow-up status snapshot (and subsequent polls)
+        // pick up the refreshed result.
+        Cmd::RecheckUpdates => {
+            let _ = client::recheck_updates();
+            None
+        }
         // Handled directly in the worker loop (streams progress); never reaches here.
         Cmd::UpdateFirmware { .. } => None,
         Cmd::SelfUpdate { .. } => None,
