@@ -23,7 +23,52 @@ use agent_buddy::{client, ota, selfupdate, setup, state, update};
 use eframe::egui;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+// --- icons ----------------------------------------------------------------
+// Icons come from a bundled Lucide font (ISC license) installed as a dedicated
+// font family — egui's stock fonts don't carry these glyphs, so without it
+// every icon renders as a missing-glyph box. The codepoints are Lucide's
+// private-use-area assignments (see `assets/lucide.ttf`).
+mod ic {
+    pub const OVERVIEW: &str = "\u{E1C1}"; // layout-dashboard
+    pub const WIFI: &str = "\u{E1AE}";
+    pub const GATEWAY: &str = "\u{E417}"; // arrow-right-left (relay)
+    pub const SETTINGS: &str = "\u{E154}";
+    pub const SUN: &str = "\u{E178}";
+    pub const MOON: &str = "\u{E11E}";
+    pub const CHECK: &str = "\u{E06C}";
+    pub const CROSS: &str = "\u{E1B2}"; // x
+    pub const STAR: &str = "\u{E412}"; // sparkles — the brand mark
+}
+
+/// A `FontId` for the bundled Lucide icon glyphs at the given size.
+fn icon_font(size: f32) -> egui::FontId {
+    egui::FontId::new(size, egui::FontFamily::Name("icons".into()))
+}
+
+/// Register the bundled Lucide icon font as a dedicated `"icons"` family (plus a
+/// last-resort proportional fallback). Called once at startup; without it the
+/// icon codepoints have no glyph and paint as boxes.
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "lucide".to_owned(),
+        egui::FontData::from_static(include_bytes!("../../assets/lucide.ttf")),
+    );
+    fonts.families.insert(
+        egui::FontFamily::Name("icons".into()),
+        vec!["lucide".to_owned()],
+    );
+    // Also append to the proportional family so a stray icon glyph used inline in
+    // ordinary text still resolves instead of tofu-ing.
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .push("lucide".to_owned());
+    ctx.set_fonts(fonts);
+}
 
 // --- palette --------------------------------------------------------------
 // Harness-agnostic: neutral surfaces, a single confident teal accent, and a
@@ -258,6 +303,9 @@ struct App {
     status: Option<StatusReport>,
     status_err: Option<String>,
     last_action: Option<(bool, String)>,
+    /// When the current `last_action` arrived — used to auto-dismiss the feedback
+    /// line after a few seconds so a stale result doesn't linger.
+    last_action_at: Option<Instant>,
     busy: bool,
     /// Live OTA transfer percentage while an update is in flight (`None` = idle).
     ota_progress: Option<u8>,
@@ -295,6 +343,9 @@ enum TrayAction {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Install the bundled icon font before anything paints, or the first
+        // frames render every icon as a missing-glyph box.
+        install_fonts(&cc.egui_ctx);
         let (tx, rx_cmd) = std::sync::mpsc::channel::<Cmd>();
         let (tx_msg, rx) = std::sync::mpsc::channel::<Msg>();
         spawn_worker(cc.egui_ctx.clone(), rx_cmd, tx_msg);
@@ -312,6 +363,7 @@ impl App {
             status: None,
             status_err: None,
             last_action: None,
+            last_action_at: None,
             busy: false,
             ota_progress: None,
             update_stage: None,
@@ -330,7 +382,31 @@ impl App {
     fn send(&mut self, cmd: Cmd) {
         self.busy = true;
         self.last_action = None;
+        self.last_action_at = None;
+        // Drop any prior error so a stale message can't sit next to a fresh
+        // action's spinner.
+        self.status_err = None;
         let _ = self.tx.send(cmd);
+    }
+
+    /// A status poll that does *not* mark the UI busy. Used for the manual
+    /// "Retry": `Cmd::Refresh` produces no `Msg::Action`, so routing it through
+    /// `send()` (which sets `busy`) would strand the "Working…" spinner on
+    /// forever. Every command that goes through `send()` produces an `Action`
+    /// that clears `busy`; bare refreshes must not.
+    fn refresh(&self) {
+        let _ = self.tx.send(Cmd::Refresh);
+    }
+
+    /// Switch pages, clearing any transient feedback so a result from one page
+    /// doesn't bleed onto the next.
+    fn set_page(&mut self, page: Page) {
+        if self.page != page {
+            self.last_action = None;
+            self.last_action_at = None;
+            self.status_err = None;
+        }
+        self.page = page;
     }
 
     fn drain(&mut self) {
@@ -352,6 +428,7 @@ impl App {
                     // the worker exits the process to hand off to the swap helper.)
                     self.update_stage = None;
                     self.last_action = Some((ok, text));
+                    self.last_action_at = Some(Instant::now());
                 }
                 Msg::OtaProgress(pct) => {
                     self.ota_progress = Some(pct);
@@ -454,8 +531,8 @@ impl App {
                     ui.painter().text(
                         rect.center(),
                         egui::Align2::CENTER_CENTER,
-                        "✦",
-                        egui::FontId::proportional(17.0),
+                        ic::STAR,
+                        icon_font(15.0),
                         p.on_accent,
                     );
                     ui.add_space(9.0);
@@ -479,20 +556,20 @@ impl App {
 
                 // Nav rows. Wi-Fi and Gateway need a running gateway; gray them
                 // out until then so a first-run user heads for the install prompt.
-                if nav_item(ui, p, "◵", "Overview", self.page == Page::Overview, true) {
-                    self.page = Page::Overview;
+                if nav_item(ui, p, ic::OVERVIEW, "Overview", self.page == Page::Overview, true) {
+                    self.set_page(Page::Overview);
                 }
                 ui.add_space(2.0);
-                if nav_item(ui, p, "≋", "Wi-Fi", self.page == Page::Wifi, running) {
-                    self.page = Page::Wifi;
+                if nav_item(ui, p, ic::WIFI, "Wi-Fi", self.page == Page::Wifi, running) {
+                    self.set_page(Page::Wifi);
                 }
                 ui.add_space(2.0);
-                if nav_item(ui, p, "⇄", "Gateway", self.page == Page::Gateway, running) {
-                    self.page = Page::Gateway;
+                if nav_item(ui, p, ic::GATEWAY, "Gateway", self.page == Page::Gateway, running) {
+                    self.set_page(Page::Gateway);
                 }
                 ui.add_space(2.0);
-                if nav_item(ui, p, "⚙", "Settings", self.page == Page::Settings, true) {
-                    self.page = Page::Settings;
+                if nav_item(ui, p, ic::SETTINGS, "Settings", self.page == Page::Settings, true) {
+                    self.set_page(Page::Settings);
                 }
 
                 // Footer pinned to the bottom: a quick light/dark toggle + version.
@@ -505,9 +582,9 @@ impl App {
                     );
                     ui.add_space(8.0);
                     let (glyph, label) = if dark {
-                        ("☀", "Light mode")
+                        (ic::SUN, "Light mode")
                     } else {
-                        ("☾", "Dark mode")
+                        (ic::MOON, "Dark mode")
                     };
                     if nav_item(ui, p, glyph, label, false, true) {
                         // Toggling flips to the opposite explicit mode and pins it.
@@ -592,7 +669,7 @@ impl App {
             );
             ui.add_space(12.0);
             if let Some(pkg_url) = in_place {
-                if primary_button(ui, p, &format!("Update & restart → {latest}"), !busy).clicked() {
+                if primary_button(ui, p, &format!("Update to {latest} & restart"), !busy).clicked() {
                     want_self_update = Some(pkg_url);
                 }
                 ui.add_space(4.0);
@@ -737,7 +814,7 @@ impl App {
             if let (Some(ssid), Some(ip)) = (&s.device_ssid, &s.device_ip) {
                 metric(ui, p, "On Wi-Fi", &format!("{ssid} · {ip}"));
                 match s.device_online {
-                    Some(true) => metric_colored(ui, p, "Internet", "Online ✓", p.good),
+                    Some(true) => metric_colored(ui, p, "Internet", "Online", p.good),
                     Some(false) => {
                         metric_colored(ui, p, "Internet", "joined, but no internet", p.bad)
                     }
@@ -784,7 +861,7 @@ impl App {
                         if primary_button(
                             ui,
                             p,
-                            &format!("Update firmware → {best_ver}"),
+                            &format!("Update firmware to {best_ver}"),
                             !self.busy,
                         )
                         .clicked()
@@ -792,7 +869,7 @@ impl App {
                             want_update = Some((board.clone(), best_url));
                         }
                     } else if device_known {
-                        metric_colored(ui, p, "Firmware update", "up to date ✓", p.good);
+                        metric_colored(ui, p, "Firmware update", "up to date", p.good);
                     } else if primary_button(ui, p, "Update firmware", !self.busy).clicked() {
                         want_update = Some((board.clone(), best_url));
                     }
@@ -889,7 +966,7 @@ impl App {
                     open_bluetooth_settings();
                 }
                 if ghost_button(ui, p, "Retry", !self.busy).clicked() {
-                    self.send(Cmd::Refresh);
+                    self.refresh();
                 }
             });
         });
@@ -937,11 +1014,7 @@ impl App {
     /// The network/password inputs + send button.
     fn wifi_form(&mut self, ui: &mut egui::Ui, p: &Pal, connected: bool) {
         field_label(ui, p, "Network");
-        ui.add(
-            egui::TextEdit::singleline(&mut self.ssid)
-                .hint_text("Wi-Fi name")
-                .desired_width(f32::INFINITY),
-        );
+        text_field(ui, &mut self.ssid, "Wi-Fi name", false);
         if !self.ssid_autofilled {
             ui.add_space(2.0);
             ui.label(
@@ -955,12 +1028,7 @@ impl App {
         ui.add_space(8.0);
 
         field_label(ui, p, "Password");
-        ui.add(
-            egui::TextEdit::singleline(&mut self.pass)
-                .password(!self.show_pass)
-                .hint_text("Wi-Fi password")
-                .desired_width(f32::INFINITY),
-        );
+        text_field(ui, &mut self.pass, "Wi-Fi password", !self.show_pass);
         ui.add_space(3.0);
         ui.checkbox(
             &mut self.show_pass,
@@ -1091,7 +1159,7 @@ impl App {
                 );
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    if primary_button(ui, p, "Uninstall everything", !self.busy).clicked() {
+                    if primary_button_compact(ui, p, "Uninstall everything", !self.busy).clicked() {
                         self.pending_uninstall = false;
                         self.send(Cmd::Uninstall);
                     }
@@ -1118,20 +1186,33 @@ impl App {
     /// Transient feedback from the last action — a spinner while busy, then a
     /// check/cross result line. Lives at the foot of whichever page issued it.
     fn action_feedback(&mut self, ui: &mut egui::Ui, p: &Pal) {
+        // How long a result lingers before it auto-dismisses.
+        const DISMISS_AFTER: Duration = Duration::from_secs(6);
         if self.busy {
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 ui.add(egui::Spinner::new().size(14.0).color(p.accent));
                 ui.label(egui::RichText::new("Working…").color(p.muted).size(12.0));
             });
-        } else if let Some((ok, text)) = &self.last_action {
+            return;
+        }
+        // Drop a stale result so it doesn't sit around forever.
+        if self.last_action_at.is_some_and(|at| at.elapsed() >= DISMISS_AFTER) {
+            self.last_action = None;
+            self.last_action_at = None;
+        }
+        if let Some((ok, text)) = self.last_action.clone() {
+            let (mark, color) = if ok {
+                (ic::CHECK, p.good)
+            } else {
+                (ic::CROSS, p.bad)
+            };
             ui.add_space(12.0);
-            let (mark, color) = if *ok { ("✓", p.good) } else { ("✕", p.bad) };
-            ui.label(
-                egui::RichText::new(format!("{mark}  {text}"))
-                    .color(color)
-                    .size(12.0),
-            );
+            ui.horizontal_top(|ui| {
+                ui.label(egui::RichText::new(mark).color(color).font(icon_font(13.0)));
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(text).color(color).size(12.0));
+            });
         }
     }
 }
@@ -1344,7 +1425,7 @@ fn spawn_worker(ctx: egui::Context, rx: Receiver<Cmd>, tx: Sender<Msg>) {
                                     false,
                                     format!(
                                         "{e}\nIf this keeps failing, allow “Agent Buddy” \
-                                         under System Settings ▸ Privacy & Security ▸ \
+                                         under System Settings > Privacy & Security > \
                                          Local Network, then try again."
                                     ),
                                 ),
@@ -1455,7 +1536,7 @@ fn disconnected_hint(s: &StatusReport) -> String {
             return "Confirm the 6-digit code shown on your buddy to finish pairing.".into();
         }
         if low.contains("permission") || low.contains("denied") || low.contains("unauthorized") {
-            return "Allow Bluetooth for Agent Buddy in System Settings → Privacy & Security → Bluetooth."
+            return "Allow Bluetooth for Agent Buddy in System Settings > Privacy & Security > Bluetooth."
                 .into();
         }
         return format!("Last try: {err}. Power on your buddy and keep it nearby.");
@@ -1579,10 +1660,20 @@ fn nav_item(
     } else {
         p.ink
     };
+    // Icon and label are painted separately: the icon needs the Lucide family,
+    // the label the proportional one, and a fixed label offset keeps every row's
+    // text aligned regardless of icon width.
     painter.text(
-        rect.left_center() + egui::vec2(13.0, 0.0),
+        rect.left_center() + egui::vec2(15.0, 0.0),
+        egui::Align2::CENTER_CENTER,
+        icon,
+        icon_font(15.0),
+        color,
+    );
+    painter.text(
+        rect.left_center() + egui::vec2(34.0, 0.0),
         egui::Align2::LEFT_CENTER,
-        format!("{icon}    {label}"),
+        label,
         egui::FontId::proportional(13.5),
         color,
     );
@@ -1619,15 +1710,18 @@ fn stat_tile(ui: &mut egui::Ui, p: &Pal, title: &str, value: &str, color: egui::
             );
             ui.add_space(7.0);
             ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("●")
-                        .color(if ok { color } else { p.faint })
-                        .size(10.0),
-                );
-                ui.add_space(2.0);
+                dot(ui, if ok { color } else { p.faint }, 4.0);
+                ui.add_space(6.0);
                 ui.label(egui::RichText::new(value).color(color).size(17.0).strong());
             });
         });
+}
+
+/// A small filled status dot, vertically centered on its row. Crisper than a
+/// glyph at this size and needs no font glyph at all.
+fn dot(ui: &mut egui::Ui, color: egui::Color32, r: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(r * 2.0, r * 2.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), r, color);
 }
 
 fn hairline(ui: &mut egui::Ui, p: &Pal) {
@@ -1639,8 +1733,8 @@ fn hairline(ui: &mut egui::Ui, p: &Pal) {
 fn status_row(ui: &mut egui::Ui, p: &Pal, label: &str, ok: bool, value: &str) {
     let color = if ok { p.good } else { p.muted };
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("●").color(color).size(11.0));
-        ui.add_space(1.0);
+        dot(ui, color, 4.5);
+        ui.add_space(7.0);
         ui.label(egui::RichText::new(label).color(p.ink).size(14.5).strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             pill(ui, p, value, color);
@@ -1681,18 +1775,51 @@ fn metric_colored(ui: &mut egui::Ui, p: &Pal, label: &str, value: &str, color: e
 
 fn field_label(ui: &mut egui::Ui, p: &Pal, text: &str) {
     ui.label(egui::RichText::new(text).color(p.muted).size(11.0).strong());
-    ui.add_space(3.0);
+    ui.add_space(4.0);
 }
 
+/// A roomy full-width single-line input. The generous inner margin gives it a
+/// height in the button family's rhythm rather than egui's cramped default.
+/// `password` masks the text.
+fn text_field(ui: &mut egui::Ui, value: &mut String, hint: &str, password: bool) -> egui::Response {
+    ui.add(
+        egui::TextEdit::singleline(value)
+            .hint_text(hint)
+            .password(password)
+            .desired_width(f32::INFINITY)
+            .margin(egui::Margin::symmetric(11.0, 10.0))
+            .vertical_align(egui::Align::Center),
+    )
+}
+
+/// Full-width primary action button. The default CTA shape — one per card.
 fn primary_button(ui: &mut egui::Ui, p: &Pal, text: &str, enabled: bool) -> egui::Response {
+    primary_button_sized(ui, p, text, enabled, ui.available_width())
+}
+
+/// Intrinsic-width primary button, for use inside a `horizontal` row beside
+/// another button (a full-width one would swallow the whole row).
+fn primary_button_compact(ui: &mut egui::Ui, p: &Pal, text: &str, enabled: bool) -> egui::Response {
+    primary_button_sized(ui, p, text, enabled, 0.0)
+}
+
+fn primary_button_sized(
+    ui: &mut egui::Ui,
+    p: &Pal,
+    text: &str,
+    enabled: bool,
+    width: f32,
+) -> egui::Response {
     let resp = ui.add_enabled(
         enabled,
         egui::Button::new(egui::RichText::new(text).color(p.on_accent).size(14.0))
             .fill(p.accent)
-            .min_size(egui::vec2(ui.available_width(), 38.0)),
+            .rounding(egui::Rounding::same(8.0))
+            .min_size(egui::vec2(width, 38.0)),
     );
     // egui won't recolor an explicit `.fill`, so paint the hover/press state on
     // top for tactile feedback: darker accent when pressed, a hair on hover.
+    // (Same 8px rounding as the button beneath, so the overlay registers.)
     if enabled {
         let over = if resp.is_pointer_button_down_on() {
             Some(p.accent_hover)
@@ -1703,7 +1830,7 @@ fn primary_button(ui: &mut egui::Ui, p: &Pal, text: &str, enabled: bool) -> egui
         };
         if let Some(fill) = over {
             ui.painter()
-                .rect_filled(resp.rect, egui::Rounding::same(9.0), fill);
+                .rect_filled(resp.rect, egui::Rounding::same(8.0), fill);
             ui.painter().text(
                 resp.rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -1721,8 +1848,9 @@ fn ghost_button(ui: &mut egui::Ui, p: &Pal, text: &str, enabled: bool) -> egui::
         enabled,
         egui::Button::new(egui::RichText::new(text).color(p.ink).size(13.0))
             .fill(p.card)
+            .rounding(egui::Rounding::same(8.0))
             .stroke(egui::Stroke::new(1.0, p.hair))
-            .min_size(egui::vec2(0.0, 32.0)),
+            .min_size(egui::vec2(0.0, 36.0)),
     )
 }
 
@@ -1745,8 +1873,9 @@ fn theme_segmented(ui: &mut egui::Ui, p: &Pal, current: ThemePref) -> Option<The
             let resp = ui.add(
                 egui::Button::new(egui::RichText::new(label).color(txt).size(13.0))
                     .fill(fill)
+                    .rounding(egui::Rounding::same(8.0))
                     .stroke(egui::Stroke::new(1.0, stroke))
-                    .min_size(egui::vec2(90.0, 32.0)),
+                    .min_size(egui::vec2(90.0, 36.0)),
             );
             if resp.clicked() {
                 chosen = Some(t);
