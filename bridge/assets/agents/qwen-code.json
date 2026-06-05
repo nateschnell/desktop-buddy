@@ -1,0 +1,37 @@
+{
+  "id": "qwen-code",
+  "name": "Qwen Code",
+  "process_names": { "win": ["qwen.exe"], "mac": ["qwen"], "linux": ["qwen"] },
+  "event_source": "hook",
+  "event_map": {
+    "SessionStart": "idle",
+    "SessionEnd": "sleeping",
+    "UserPromptSubmit": "thinking",
+    "PreToolUse": "working",
+    "PostToolUse": "working",
+    "Stop": "attention",
+    "PermissionRequest": "attention"
+  },
+  "capabilities": {
+    "permission_approval": true,
+    "notification_hook": true,
+    "interactive_bubble": true,
+    "session_end": true
+  },
+  "install": {
+    "config_format": "qwen-settings-json",
+    "target_path": { "home_rel": ".qwen/settings.json" },
+    "stdin_format": "qwenHookJson",
+    "matcher": "*",
+    "events": ["SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "PermissionRequest"]
+  },
+  "palette": {
+    "body": "#7B5CFF",
+    "bg": "#000000",
+    "text": "#FFFFFF",
+    "text_dim": "#808080",
+    "ink": "#000000"
+  },
+  "panels": ["sessions"],
+  "revision": 1
+}

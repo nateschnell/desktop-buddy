@@ -1,0 +1,35 @@
+{
+  "id": "pi",
+  "name": "Pi",
+  "process_names": { "win": ["pi.exe"], "mac": ["pi"], "linux": ["pi"] },
+  "event_source": "extension",
+  "event_map": {
+    "SessionStart": "idle",
+    "UserPromptSubmit": "thinking",
+    "PreToolUse": "working",
+    "PostToolUse": "working",
+    "PostToolUseFailure": "error",
+    "Stop": "attention",
+    "PreCompact": "sweeping",
+    "PostCompact": "attention",
+    "SessionEnd": "sleeping"
+  },
+  "capabilities": {
+    "session_end": true
+  },
+  "install": {
+    "config_format": "pi-extension",
+    "target_path": { "home_rel": ".pi/agent/extensions/agent-buddy", "from_config_dir": false },
+    "stdin_format": "pascalCase",
+    "events": ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "SessionEnd", "PreCompact", "PostCompact", "PostToolUseFailure"]
+  },
+  "palette": {
+    "body": "#E0A458",
+    "bg": "#000000",
+    "text": "#FFFFFF",
+    "text_dim": "#808080",
+    "ink": "#000000"
+  },
+  "panels": ["sessions"],
+  "revision": 1
+}

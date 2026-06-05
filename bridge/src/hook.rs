@@ -36,16 +36,28 @@ const STATE_TIMEOUT: Duration = Duration::from_secs(2);
 /// only bounds a hung daemon, and the result is discarded regardless.
 const TELEMETRY_TIMEOUT: Duration = Duration::from_millis(400);
 
-pub async fn run(event_name: &str) -> Result<()> {
+pub async fn run(event_name: &str, agent: Option<&str>) -> Result<()> {
     // Read the hook payload from stdin (may be empty for some events).
     let mut raw = String::new();
     std::io::stdin().read_to_string(&mut raw).ok();
     let payload: Value = serde_json::from_str(raw.trim()).unwrap_or(Value::Null);
 
-    let canonical = canonical_event_name(event_name, &payload);
-    let event = match build_event(&canonical, &payload) {
-        Some(e) => e,
-        None => return Ok(()), // event we don't model — no-op, exit 0
+    // Claude Code (the default, no `--agent`) keeps the byte-identical legacy
+    // path below, including transcript-derived token/context telemetry. Any
+    // other harness is profile-driven: its event name maps through the loaded
+    // profile's `event_map` to one of the same IPC events.
+    let is_claude = matches!(agent, None | Some("claude-code"));
+    let event = if is_claude {
+        let canonical = canonical_event_name(event_name, &payload);
+        match build_event(&canonical, &payload) {
+            Some(e) => e,
+            None => return Ok(()), // event we don't model — no-op, exit 0
+        }
+    } else {
+        match build_event_for_agent(agent.unwrap(), event_name, &payload) {
+            Some(e) => e,
+            None => return Ok(()),
+        }
     };
 
     // The gate. Only `PermissionRequest` decides a tool's fate on the device;
@@ -76,6 +88,20 @@ pub async fn run(event_name: &str) -> Result<()> {
     };
     let _ = relay(event, timeout).await;
     Ok(())
+}
+
+/// Build an IPC event for a non-Claude harness, profile-driven. Loads the
+/// agent's profile and maps the harness event name through its `event_map`
+/// (see [`crate::ingest`]). Returns `None` for an unknown agent or unmapped
+/// event (a clean no-op, exit 0 — a hook must never wedge the harness).
+fn build_event_for_agent(agent: &str, event_name: &str, payload: &Value) -> Option<HookEvent> {
+    let profiles = crate::agent::load_profiles();
+    let profile = profiles.get(agent)?;
+    let name = crate::ingest::event_name(event_name, payload);
+    // Reclassify failure/status events by payload inspection (Cursor stop=error,
+    // Antigravity PostToolUse/Stop failure) before the static event_map lookup.
+    let name = crate::ingest::reclassify_event(profile, &name, payload);
+    crate::ingest::map_hook_event(profile, &name, payload)
 }
 
 /// Claude Code passes the event name both as our CLI arg and (usually) in the
@@ -112,11 +138,17 @@ fn build_event(name: &str, payload: &Value) -> Option<HookEvent> {
         }),
         "Stop" | "SubagentStop" => {
             let (session_total_tokens, model, ctx_tokens) = telemetry_fields(payload);
+            // A stop-hook continuation (`stop_hook_active`) is not a real turn
+            // completion — suppress the celebrate so we don't fire it twice.
+            let continuation = payload
+                .get("stop_hook_active")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             Some(HookEvent::Stop {
                 session_id,
                 session_total_tokens,
                 summary: last_assistant_summary(payload),
-                final_turn: name == "Stop",
+                final_turn: name == "Stop" && !continuation,
                 model,
                 ctx_tokens,
                 cwd,
@@ -362,7 +394,31 @@ fn truncate_bytes(s: &str, max: usize) -> String {
 
 fn read_transcript(payload: &Value) -> Option<String> {
     let path = payload.get("transcript_path").and_then(|v| v.as_str())?;
-    std::fs::read_to_string(path).ok()
+    // Read only the tail: a long session's transcript can be many MB, but every
+    // consumer here scans for the *most recent* assistant message (model, token
+    // usage, summary) — all of which live in the final lines. Bounding the read
+    // caps hot-path memory/latency on every Stop/PreToolUse.
+    read_tail(path, 256 * 1024)
+}
+
+/// Read at most the last `max` bytes of a file as (lossy) UTF-8. When the file
+/// is larger than `max` we drop the partial first line so callers only ever see
+/// whole JSONL records.
+fn read_tail(path: &str, max: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let start = len.saturating_sub(max);
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    let mut text = String::from_utf8_lossy(&buf).into_owned();
+    if start > 0 {
+        if let Some(nl) = text.find('\n') {
+            text.drain(..=nl); // discard the line we started in the middle of
+        }
+    }
+    Some(text)
 }
 
 /// Connect to the daemon, send the event, await the response (bounded).

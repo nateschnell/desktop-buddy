@@ -8,12 +8,15 @@
 //! that owns the BLE radio, so the GUI never touches Bluetooth itself — it is a
 //! thin client over the socket the daemon already publishes.
 
+pub mod agent;
 pub mod ble;
 pub mod client;
 pub mod daemon;
 pub mod hook;
+pub mod ingest;
 pub mod ipc;
 pub mod ota;
+pub mod packs;
 pub mod power;
 pub mod protocol;
 pub mod selfupdate;

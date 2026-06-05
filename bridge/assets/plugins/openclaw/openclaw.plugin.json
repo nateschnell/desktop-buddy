@@ -1,0 +1,13 @@
+{
+  "id": "agent-buddy",
+  "name": "Agent Buddy",
+  "description": "Forward OpenClaw lifecycle and tool-state events to the Agent Buddy hardware device.",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

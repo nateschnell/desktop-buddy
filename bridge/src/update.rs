@@ -144,10 +144,12 @@ pub fn latest_app_release(releases: &[Release]) -> Option<&Release> {
 
 /// The newest firmware available for `board`, across ALL published releases that
 /// carry a matching `firmware-<board>.bin` asset — both the desktop (`v*`) and
-/// firmware-only (`fw-v*`) tracks. Returns the clean firmware version string
-/// (the tag with any `fw-` prefix stripped, e.g. `"v0.1.4"`) and the `.bin`
-/// asset's download URL. `None` if no release offers an image for the board.
-pub fn latest_firmware(releases: &[Release], board: &str) -> Option<(String, String)> {
+/// firmware-only (`fw-v*`) tracks. Returns the clean firmware version string (the
+/// tag with any `fw-` prefix stripped, e.g. `"v0.1.4"`), the `.bin` asset's
+/// download URL, and the download URL of its sibling `<bin>.sha256` checksum
+/// asset when the release published one (used to verify the image before
+/// flashing). `None` if no release offers an image for the board.
+pub fn latest_firmware(releases: &[Release], board: &str) -> Option<(String, String, Option<String>)> {
     let names = crate::ota::firmware_filenames(board);
     releases
         .iter()
@@ -156,10 +158,13 @@ pub fn latest_firmware(releases: &[Release], board: &str) -> Option<(String, Str
             let clean = firmware_version_string(&r.tag);
             let ver = parse_version(&clean)?;
             let asset = names.iter().find_map(|n| r.asset(n))?;
-            Some((ver, clean, asset.url.clone()))
+            let sha_url = r
+                .asset(&format!("{}.sha256", asset.name))
+                .map(|a| a.url.clone());
+            Some((ver, clean, asset.url.clone(), sha_url))
         })
-        .max_by_key(|(ver, _, _)| *ver)
-        .map(|(_, vstr, url)| (vstr, url))
+        .max_by_key(|(ver, _, _, _)| *ver)
+        .map(|(_, vstr, url, sha)| (vstr, url, sha))
 }
 
 /// Every board id any release offers a `firmware-<board>.bin` image for, plus
@@ -204,6 +209,73 @@ pub fn download_firmware(url: &str) -> Result<Vec<u8>> {
     ])?;
     if bytes.is_empty() {
         return Err(anyhow!("the downloaded firmware was empty"));
+    }
+    Ok(bytes)
+}
+
+/// Lowercase hex SHA-256 of `bytes`.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut s = String::with_capacity(64);
+    for b in digest {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Fetch a `*.sha256` checksum sidecar and extract the 64-char hex digest. The
+/// file may be either a bare hash or `sha256sum` format (`<hash>␠␠<name>`); we
+/// take the first whitespace-delimited token and validate it. Blocking.
+pub fn fetch_expected_sha256(url: &str) -> Result<String> {
+    let body = curl(&[
+        "-fsSL",
+        "-L",
+        "--max-time",
+        "30",
+        "-H",
+        "User-Agent: agent-buddy",
+        url,
+    ])?;
+    let text = String::from_utf8_lossy(&body);
+    let hash = text
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(anyhow!("malformed sha256 checksum in {url}"));
+    }
+    Ok(hash)
+}
+
+/// Download a firmware `.bin` and verify it against the release's published
+/// checksum before returning it. When `sha256_url` is `Some`, a mismatch is a
+/// hard error (the image is never flashed). When `None` — an older release that
+/// predates checksum publishing — the download proceeds with a logged warning,
+/// since integrity here is best-effort (the device still MD5s the BLE transfer).
+/// Blocking.
+pub fn download_firmware_verified(url: &str, sha256_url: Option<&str>) -> Result<Vec<u8>> {
+    let bytes = download_firmware(url)?;
+    match sha256_url {
+        Some(sha_url) => {
+            let expected =
+                fetch_expected_sha256(sha_url).context("fetching the firmware checksum")?;
+            let actual = sha256_hex(&bytes);
+            if actual != expected {
+                return Err(anyhow!(
+                    "firmware checksum mismatch — refusing to flash \
+                     (expected {expected}, got {actual})"
+                ));
+            }
+        }
+        None => {
+            tracing::warn!(
+                "firmware release published no .sha256 checksum — \
+                 flashing without download-integrity verification"
+            );
+        }
     }
     Ok(bytes)
 }
@@ -339,9 +411,10 @@ mod tests {
         "tag_name": "fw-v0.1.4", "html_url": "https://example/fw-v0.1.4",
         "draft": false, "prerelease": false,
         "assets": [
-          {"name": "firmware-cyd.bin",      "browser_download_url": "https://dl/cyd-0.1.4.bin"},
-          {"name": "firmware-cyd.version",  "browser_download_url": "https://dl/cyd-0.1.4.version"},
-          {"name": "firmware-fnk0104.bin",  "browser_download_url": "https://dl/fnk-0.1.4.bin"}
+          {"name": "firmware-cyd.bin",         "browser_download_url": "https://dl/cyd-0.1.4.bin"},
+          {"name": "firmware-cyd.bin.sha256",  "browser_download_url": "https://dl/cyd-0.1.4.bin.sha256"},
+          {"name": "firmware-cyd.version",     "browser_download_url": "https://dl/cyd-0.1.4.version"},
+          {"name": "firmware-fnk0104.bin",     "browser_download_url": "https://dl/fnk-0.1.4.bin"}
         ]
       },
       {
@@ -377,15 +450,33 @@ mod tests {
     fn firmware_latest_spans_both_tracks_per_board() {
         let rels = parse_releases(SAMPLE.as_bytes()).unwrap();
 
-        // CYD: newest image is the firmware-only fw-v0.1.4 (clean version v0.1.4).
-        let (ver, url) = latest_firmware(&rels, "cyd").expect("cyd firmware");
+        // CYD: newest image is the firmware-only fw-v0.1.4 (clean version v0.1.4),
+        // and that release published a sibling .sha256 for it.
+        let (ver, url, sha) = latest_firmware(&rels, "cyd").expect("cyd firmware");
         assert_eq!(ver, "v0.1.4");
         assert_eq!(url, "https://dl/cyd-0.1.4.bin");
+        assert_eq!(sha.as_deref(), Some("https://dl/cyd-0.1.4.bin.sha256"));
 
-        // FNK0104: both releases have it; newest is fw-v0.1.4.
-        let (ver, url) = latest_firmware(&rels, "fnk0104").expect("fnk firmware");
+        // FNK0104: both releases have it; newest is fw-v0.1.4, which here ships
+        // no checksum sidecar — sha resolves to None (best-effort path).
+        let (ver, url, sha) = latest_firmware(&rels, "fnk0104").expect("fnk firmware");
         assert_eq!(ver, "v0.1.4");
         assert_eq!(url, "https://dl/fnk-0.1.4.bin");
+        assert_eq!(sha, None);
+    }
+
+    #[test]
+    fn sha256_hex_matches_known_vector() {
+        // SHA-256 of the empty input.
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        // SHA-256 of "abc".
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -413,10 +504,10 @@ mod tests {
           "assets": [{"name": "firmware.bin", "browser_download_url": "https://dl/legacy.bin"}]
         }]"#;
         let rels = parse_releases(json.as_bytes()).unwrap();
-        // CYD accepts the legacy name…
+        // CYD accepts the legacy name… (no checksum sidecar in this release).
         assert_eq!(
             latest_firmware(&rels, "cyd"),
-            Some(("v0.1.0".to_string(), "https://dl/legacy.bin".to_string()))
+            Some(("v0.1.0".to_string(), "https://dl/legacy.bin".to_string(), None))
         );
         // …but another board must not flash the CYD image.
         assert_eq!(latest_firmware(&rels, "fnk0104"), None);

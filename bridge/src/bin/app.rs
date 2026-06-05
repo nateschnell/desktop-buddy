@@ -42,16 +42,49 @@ mod ic {
     pub const STAR: &str = "\u{E412}"; // sparkles — the brand mark
 }
 
+/// License notices for the fonts bundled *into* this binary: the Lucide icon
+/// font (`assets/lucide.ttf`, ISC + the Feather MIT subset) and IBM Plex Sans
+/// (`assets/IBMPlexSans-*.ttf`, SIL OFL 1.1). The font bytes are `include_bytes!`'d
+/// below, so the notices ship compiled into every copy of the GUI (and are
+/// surfaced in Settings → About). The packaging scripts also drop the same text
+/// beside the binary as `THIRD_PARTY_LICENSES` for good measure.
+const THIRD_PARTY_LICENSES: &str = concat!(
+    "=== Lucide icon font (assets/lucide.ttf) ===\n\n",
+    include_str!("../../assets/LICENSE"),
+    "\n\n=== IBM Plex Sans (assets/IBMPlexSans-*.ttf) ===\n\n",
+    include_str!("../../assets/IBMPlexSans-LICENSE.txt"),
+);
+
 /// A `FontId` for the bundled Lucide icon glyphs at the given size.
 fn icon_font(size: f32) -> egui::FontId {
     egui::FontId::new(size, egui::FontFamily::Name("icons".into()))
 }
 
-/// Register the bundled Lucide icon font as a dedicated `"icons"` family (plus a
-/// last-resort proportional fallback). Called once at startup; without it the
-/// icon codepoints have no glyph and paint as boxes.
+/// The family carrying the bundled SemiBold weight. egui has no synthetic bold —
+/// `RichText::strong()` only swaps in a color, which we already override — so the
+/// only way to get real weight contrast is to route emphasized text through its
+/// own bold font family. Headings/labels/values use `.family(bold())`.
+fn bold() -> egui::FontFamily {
+    egui::FontFamily::Name("bold".into())
+}
+
+/// Register the bundled brand + icon fonts. The proportional default becomes IBM
+/// Plex Sans so the UI stops reading as stock egui; a dedicated `"bold"` family
+/// carries Plex SemiBold for real weight hierarchy; Lucide is its own `"icons"`
+/// family. Called once at startup; without it the icon codepoints have no glyph
+/// and paint as boxes, and text falls back to egui's default face. Each custom
+/// family keeps egui's bundled fonts as a fallback tail so any glyph Plex/Lucide
+/// lack (arrows, emoji) still resolves instead of tofu-ing.
 fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "plex".to_owned(),
+        egui::FontData::from_static(include_bytes!("../../assets/IBMPlexSans-Regular.ttf")),
+    );
+    fonts.font_data.insert(
+        "plex-sb".to_owned(),
+        egui::FontData::from_static(include_bytes!("../../assets/IBMPlexSans-SemiBold.ttf")),
+    );
     fonts.font_data.insert(
         "lucide".to_owned(),
         egui::FontData::from_static(include_bytes!("../../assets/lucide.ttf")),
@@ -60,15 +93,46 @@ fn install_fonts(ctx: &egui::Context) {
         egui::FontFamily::Name("icons".into()),
         vec!["lucide".to_owned()],
     );
-    // Also append to the proportional family so a stray icon glyph used inline in
-    // ordinary text still resolves instead of tofu-ing.
-    fonts
-        .families
-        .entry(egui::FontFamily::Proportional)
-        .or_default()
-        .push("lucide".to_owned());
+    // Proportional: Plex first (the brand face), egui's defaults as a glyph
+    // fallback, plus Lucide so a stray inline icon glyph still resolves.
+    {
+        let prop = fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default();
+        prop.insert(0, "plex".to_owned());
+        prop.push("lucide".to_owned());
+    }
+    // Bold: Plex SemiBold first, sharing the same fallback tail (degrades to Plex
+    // regular, then egui's faces, for anything SemiBold doesn't cover).
+    let mut bold_fam = fonts.families[&egui::FontFamily::Proportional].clone();
+    bold_fam.insert(0, "plex-sb".to_owned());
+    fonts.families.insert(bold(), bold_fam);
     ctx.set_fonts(fonts);
 }
+
+// --- platform-specific copy -----------------------------------------------
+// User-facing instructions that name an OS settings pane must match the OS the
+// build runs on — otherwise Windows/Linux users are handed Mac directions.
+#[cfg(target_os = "macos")]
+const THIS_COMPUTER: &str = "Mac";
+#[cfg(not(target_os = "macos"))]
+const THIS_COMPUTER: &str = "computer";
+
+#[cfg(target_os = "macos")]
+const BT_SETTINGS_PATH: &str = "System Settings > Privacy & Security > Bluetooth";
+#[cfg(target_os = "windows")]
+const BT_SETTINGS_PATH: &str = "Settings > Bluetooth & devices";
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+const BT_SETTINGS_PATH: &str = "your system’s Bluetooth settings";
+
+// Shown after a failed OTA flash. On macOS the Local Network permission is the
+// usual culprit; elsewhere it's almost always a Wi-Fi mismatch.
+#[cfg(target_os = "macos")]
+const OTA_FAIL_HINT: &str = "If this keeps failing, allow “Agent Buddy” under System Settings > Privacy & Security > Local Network, then try again.";
+#[cfg(not(target_os = "macos"))]
+const OTA_FAIL_HINT: &str =
+    "If this keeps failing, make sure this computer and your buddy are on the same Wi-Fi, then try again.";
 
 // --- palette --------------------------------------------------------------
 // Harness-agnostic: neutral surfaces, a single confident teal accent, and a
@@ -91,6 +155,7 @@ struct Pal {
     hair: egui::Color32,         // hairlines, borders, separators
     field: egui::Color32,        // inset text-field well
     nav_active: egui::Color32,   // active nav-row tint
+    shadow: egui::Color32,       // card drop-shadow tint (pre-blurred alpha)
 }
 
 impl Pal {
@@ -110,6 +175,9 @@ impl Pal {
             hair: egui::Color32::from_rgb(0xE3, 0xE8, 0xEA),
             field: egui::Color32::from_rgb(0xF1, 0xF4, 0xF5),
             nav_active: egui::Color32::from_rgb(0xE0, 0xF2, 0xF1),
+            // A soft, cool drop shadow lifts cards off the page. Kept low-alpha so
+            // it reads as depth, not a border.
+            shadow: egui::Color32::from_black_alpha(20),
         }
     }
 
@@ -129,6 +197,9 @@ impl Pal {
             hair: egui::Color32::from_rgb(0x23, 0x2C, 0x2E),
             field: egui::Color32::from_rgb(0x10, 0x16, 0x17),
             nav_active: egui::Color32::from_rgb(0x10, 0x2A, 0x28),
+            // Darker, slightly stronger so the lift still registers against the
+            // near-black background.
+            shadow: egui::Color32::from_black_alpha(90),
         }
     }
 }
@@ -192,7 +263,14 @@ enum Cmd {
     /// connected device's board id (selects the image + OTA slot) and the source:
     /// `url: Some` downloads that newer image from the GitHub release first;
     /// `url: None` flashes the image bundled with this app.
-    UpdateFirmware { board: String, url: Option<String> },
+    UpdateFirmware {
+        board: String,
+        url: Option<String>,
+        sha256_url: Option<String>,
+    },
+    /// Switch the active agent harness. The daemon re-wires hooks + re-themes the
+    /// device.
+    SetAgent { id: String },
     /// Update *this app* in place: download the newer signed installer from the
     /// release (`url` = the platform package's direct download), verify it, swap
     /// the bundle, and relaunch. The worker exits the process on success — the
@@ -215,6 +293,10 @@ enum Msg {
     Action(bool, String),
     /// OTA transfer progress, 0..=100. Drives the update progress bar.
     OtaProgress(u8),
+    /// A human label for the current firmware-update phase ("Downloading…",
+    /// "Sending to your buddy…", "Verifying & rebooting…"). Shown above the bar so
+    /// phases the percentage can't measure (download, verify) still reassure.
+    OtaPhase(String),
     /// A short progress label for an in-place app self-update ("Downloading
     /// update…", "Verifying signature…", …). Drives the install overlay.
     UpdateStage(String),
@@ -313,8 +395,11 @@ struct App {
     /// line after a few seconds so a stale result doesn't linger.
     last_action_at: Option<Instant>,
     busy: bool,
-    /// Live OTA transfer percentage while an update is in flight (`None` = idle).
+    /// Live OTA transfer percentage while an update is in flight (`None` = idle,
+    /// or a non-measurable phase like download/verify that shows a spinner).
     ota_progress: Option<u8>,
+    /// Current firmware-update phase label (`None` = no update running).
+    ota_phase: Option<String>,
     /// Current stage label while an in-place app self-update is running (`None` =
     /// not updating). When set, the content pane shows a full install overlay.
     update_stage: Option<String>,
@@ -342,6 +427,11 @@ struct App {
     /// When we last asked the daemon to re-poll for updates — throttles the
     /// focus-driven recheck so rapid focus flapping can't hammer GitHub.
     last_update_recheck: Option<Instant>,
+    /// The connection state the tray icon currently shows — so we only redraw the
+    /// menu-bar glyph when it actually changes, not every frame. Unused on Linux,
+    /// which has no tray.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    tray_state: TrayState,
 }
 
 /// What a tray menu item does when clicked.
@@ -351,6 +441,35 @@ enum TrayAction {
     Stop,
     Uninstall,
     Quit,
+}
+
+/// Connection state the tray icon reflects, so the menu-bar glyph shows status
+/// at a glance (filled = linked, ring = running-but-unlinked, faint = off).
+/// Unused on Linux, which has no tray.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+enum TrayState {
+    Off,
+    Idle,
+    Linked,
+}
+
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+impl TrayState {
+    fn from_status(st: Option<&StatusReport>) -> Self {
+        match st {
+            None => TrayState::Off,
+            Some(s) if s.device_connected => TrayState::Linked,
+            Some(_) => TrayState::Idle,
+        }
+    }
+    fn tooltip(self) -> &'static str {
+        match self {
+            TrayState::Off => "Agent Buddy — gateway off",
+            TrayState::Idle => "Agent Buddy — buddy not linked",
+            TrayState::Linked => "Agent Buddy — buddy linked",
+        }
+    }
 }
 
 impl App {
@@ -381,6 +500,7 @@ impl App {
             last_action_at: None,
             busy: false,
             ota_progress: None,
+            ota_phase: None,
             update_stage: None,
             page: Page::Overview,
             theme: load_theme_pref(),
@@ -393,8 +513,25 @@ impl App {
             pending_uninstall: false,
             was_focused: true,
             last_update_recheck: Some(Instant::now()),
+            tray_state: TrayState::Off,
         }
     }
+
+    /// Redraw the menu-bar icon when the connection state changes, so it reflects
+    /// linked / running / off at a glance. No-op where there's no tray.
+    #[cfg(not(target_os = "linux"))]
+    fn refresh_tray_icon(&mut self, st: Option<&StatusReport>) {
+        let next = TrayState::from_status(st);
+        if next != self.tray_state {
+            self.tray_state = next;
+            if let Some(tray) = &self.tray {
+                let _ = tray.set_icon(Some(tray_icon_image(next)));
+                let _ = tray.set_tooltip(Some(next.tooltip()));
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    fn refresh_tray_icon(&mut self, _st: Option<&StatusReport>) {}
 
     fn send(&mut self, cmd: Cmd) {
         self.busy = true;
@@ -453,6 +590,7 @@ impl App {
                 Msg::Action(ok, text) => {
                     self.busy = false;
                     self.ota_progress = None;
+                    self.ota_phase = None;
                     // A failed self-update reports here; clear the overlay so the
                     // panel comes back. (A *successful* one never reaches this —
                     // the worker exits the process to hand off to the swap helper.)
@@ -462,6 +600,9 @@ impl App {
                 }
                 Msg::OtaProgress(pct) => {
                     self.ota_progress = Some(pct);
+                }
+                Msg::OtaPhase(s) => {
+                    self.ota_phase = Some(s);
                 }
                 Msg::UpdateStage(s) => {
                     self.update_stage = Some(s);
@@ -506,6 +647,7 @@ impl eframe::App for App {
         // mutate self (send commands, edit form fields) without borrow fights.
         let status = self.status.clone();
         let running = status.is_some();
+        self.refresh_tray_icon(status.as_ref());
 
         // Without a running gateway only Overview (install prompt) and Settings
         // are meaningful — don't strand the user on an empty Wi-Fi/Gateway page.
@@ -581,7 +723,7 @@ impl App {
                             egui::RichText::new("Agent Buddy")
                                 .color(p.ink)
                                 .size(16.0)
-                                .strong(),
+                                .family(bold()),
                         );
                         ui.label(
                             egui::RichText::new("Control panel")
@@ -653,7 +795,7 @@ impl App {
                         Page::Gateway => "Gateway",
                         Page::Settings => "Settings",
                     };
-                    ui.label(egui::RichText::new(title).color(p.ink).size(20.0).strong());
+                    ui.label(egui::RichText::new(title).color(p.ink).size(20.0).family(bold()));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let (text, color) = match st {
                             None => ("Gateway off", p.muted),
@@ -698,7 +840,7 @@ impl App {
                 egui::RichText::new("Update available")
                     .color(p.accent)
                     .size(15.0)
-                    .strong(),
+                    .family(bold()),
             );
             ui.add_space(4.0);
             ui.label(
@@ -761,7 +903,7 @@ impl App {
                     egui::RichText::new("Updating Agent Buddy")
                         .color(p.ink)
                         .size(17.0)
-                        .strong(),
+                        .family(bold()),
                 );
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new(stage).color(p.muted).size(13.0));
@@ -773,6 +915,13 @@ impl App {
                     .color(p.faint)
                     .size(11.0),
                 );
+                ui.add_space(12.0);
+                // Abandoning the download is harmless: the swap helper only spawns
+                // after a successful download+verify, so /Applications is untouched.
+                if ghost_button(ui, p, "Cancel", true).clicked() {
+                    self.update_stage = None;
+                    self.busy = false;
+                }
                 ui.add_space(8.0);
             });
         });
@@ -783,28 +932,46 @@ impl App {
         // seen (it renders nothing when none is available).
         self.update_banner(ui, p, st);
 
-        // A flashing firmware update owns the page — the buddy "disconnects" over
-        // BLE during the flash, so nothing else here is meaningful meanwhile.
-        if let Some(pct) = self.ota_progress {
+        // A firmware update owns the page — the buddy "disconnects" over BLE
+        // during the flash, so nothing else here is meaningful meanwhile. Shown
+        // for any live phase, not just the transfer: the download and verify
+        // phases have no percentage, so they spin under a phase label instead.
+        if self.ota_progress.is_some() || self.ota_phase.is_some() {
+            let pct = self.ota_progress;
+            let phase = self.ota_phase.clone();
             card(ui, p, |ui| {
                 ui.label(
                     egui::RichText::new("Updating firmware")
                         .color(p.ink)
                         .size(15.0)
-                        .strong(),
+                        .family(bold()),
                 );
+                ui.add_space(10.0);
+                if let Some(pct) = pct {
+                    ui.add(
+                        egui::ProgressBar::new(pct as f32 / 100.0)
+                            .desired_height(10.0)
+                            .fill(p.accent)
+                            .text(format!("{pct}%")),
+                    );
+                } else {
+                    // No measurable denominator yet (downloading / verifying).
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().size(16.0).color(p.accent));
+                    });
+                }
+                if let Some(phase) = phase {
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(phase).color(p.muted).size(12.5));
+                }
                 ui.add_space(8.0);
-                ui.add(
-                    egui::ProgressBar::new(pct as f32 / 100.0)
-                        .desired_height(10.0)
-                        .fill(p.accent)
-                        .text(format!("{pct}%")),
-                );
-                ui.add_space(6.0);
                 ui.label(
-                    egui::RichText::new("Keep the buddy powered — it reboots when done.")
-                        .color(p.muted)
-                        .size(11.5),
+                    egui::RichText::new(
+                        "Keep your buddy powered and nearby — it reboots when done. If the \
+                         update is interrupted, your buddy stays safe on its current version.",
+                    )
+                    .color(p.faint)
+                    .size(11.5),
                 );
             });
             return;
@@ -828,7 +995,7 @@ impl App {
         ui.add_space(10.0);
 
         // Details card: the buddy's vitals + the firmware-update action.
-        let mut want_update: Option<(String, Option<String>)> = None;
+        let mut want_update: Option<(String, Option<String>, Option<String>)> = None;
         card(ui, p, |ui| {
             if !s.device_connected {
                 ui.label(
@@ -855,9 +1022,9 @@ impl App {
                 match s.device_online {
                     Some(true) => metric_colored(ui, p, "Internet", "Online", p.good),
                     Some(false) => {
-                        metric_colored(ui, p, "Internet", "joined, but no internet", p.bad)
+                        metric_colored(ui, p, "Internet", "Joined, no internet", p.bad)
                     }
-                    None => metric_colored(ui, p, "Internet", "checking…", p.muted),
+                    None => metric_colored(ui, p, "Internet", "Checking…", p.muted),
                 }
                 // OTA firmware update — needs Wi-Fi (ip known). The image can come
                 // from the copy bundled with this app OR a newer one published to
@@ -870,13 +1037,18 @@ impl App {
                     .device_board
                     .clone()
                     .unwrap_or_else(|| ota::DEFAULT_BOARD.to_string());
-                let cand = |ver: Option<String>, url: Option<String>| {
-                    ver.and_then(|v| update::parse_version(&v).map(|pv| (pv, v, url)))
+                // Each candidate carries (parsed_version, version_string, bin_url,
+                // checksum_url). The bundled image is local (trusted, no checksum);
+                // the release image carries the published .sha256 so the flash path
+                // can verify the download before applying it.
+                let cand = |ver: Option<String>, url: Option<String>, sha: Option<String>| {
+                    ver.and_then(|v| update::parse_version(&v).map(|pv| (pv, v, url, sha)))
                 };
-                let bundled = cand(ota::bundled_firmware_version(&board), None);
+                let bundled = cand(ota::bundled_firmware_version(&board), None, None);
                 let release = cand(
                     s.firmware_latest.as_ref().map(|f| f.version.clone()),
                     s.firmware_latest.as_ref().map(|f| f.url.clone()),
+                    s.firmware_latest.as_ref().and_then(|f| f.sha256_url.clone()),
                 );
                 let best = match (bundled, release) {
                     (Some(b), Some(r)) => Some(if r.0 > b.0 { r } else { b }),
@@ -884,7 +1056,7 @@ impl App {
                     (None, Some(r)) => Some(r),
                     (None, None) => None,
                 };
-                if let Some((_, best_ver, best_url)) = best {
+                if let Some((_, best_ver, best_url, best_sha)) = best {
                     let newer = s
                         .device_fw
                         .as_deref()
@@ -905,18 +1077,36 @@ impl App {
                         )
                         .clicked()
                         {
-                            want_update = Some((board.clone(), best_url));
+                            want_update = Some((board.clone(), best_url, best_sha));
                         }
                     } else if device_known {
                         metric_colored(ui, p, "Firmware update", "up to date", p.good);
                     } else if primary_button(ui, p, "Update firmware", !self.busy).clicked() {
-                        want_update = Some((board.clone(), best_url));
+                        want_update = Some((board.clone(), best_url, best_sha));
+                    }
+                    // Prime the macOS Local Network prompt: the OTA flow's first
+                    // packet trips it, so explain why before the user is surprised.
+                    #[cfg(target_os = "macos")]
+                    if newer || !device_known {
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "On the first update, macOS asks to allow Agent Buddy on your \
+                                 local network — that’s how it reaches your buddy over Wi-Fi.",
+                            )
+                            .color(p.faint)
+                            .size(11.0),
+                        );
                     }
                 }
             }
         });
-        if let Some((board, url)) = want_update {
-            self.send(Cmd::UpdateFirmware { board, url });
+        if let Some((board, url, sha256_url)) = want_update {
+            self.send(Cmd::UpdateFirmware {
+                board,
+                url,
+                sha256_url,
+            });
         }
 
         // First-run pairing guidance while the buddy isn't linked.
@@ -933,7 +1123,7 @@ impl App {
                     egui::RichText::new("RECENT ACTIVITY")
                         .color(p.muted)
                         .size(10.5)
-                        .strong(),
+                        .family(bold()),
                 );
                 ui.add_space(4.0);
                 for e in s.entries.iter().take(6) {
@@ -952,7 +1142,7 @@ impl App {
                 egui::RichText::new("Get started")
                     .color(p.ink)
                     .size(16.0)
-                    .strong(),
+                    .family(bold()),
             );
             ui.add_space(6.0);
             ui.label(
@@ -987,7 +1177,7 @@ impl App {
                 egui::RichText::new("Pair your buddy")
                     .color(p.ink)
                     .size(15.0)
-                    .strong(),
+                    .family(bold()),
             );
             ui.add_space(4.0);
             ui.label(
@@ -1022,7 +1212,7 @@ impl App {
                 egui::RichText::new("Provision Wi-Fi")
                     .color(p.ink)
                     .size(15.0)
-                    .strong(),
+                    .family(bold()),
             );
             ui.add_space(2.0);
             if let (true, Some(s)) = (online, st) {
@@ -1136,7 +1326,7 @@ impl App {
                 egui::RichText::new("Appearance")
                     .color(p.ink)
                     .size(15.0)
-                    .strong(),
+                    .family(bold()),
             );
             ui.add_space(8.0);
             field_label(ui, p, "Theme");
@@ -1152,6 +1342,54 @@ impl App {
             );
         });
 
+        // Agent — which coding harness the buddy follows. Switching re-wires that
+        // harness's hooks and re-themes the device. Only shown with a running
+        // gateway (it's what supplies the available-agents list).
+        if let Some(s) = st {
+            if !s.available_agents.is_empty() {
+                ui.add_space(10.0);
+                let current = s.active_agent.clone();
+                let agents = s.available_agents.clone();
+                let current_name = agents
+                    .iter()
+                    .find(|a| a.id == current)
+                    .map(|a| a.name.clone())
+                    .unwrap_or_else(|| current.clone());
+                let busy = self.busy;
+                let mut chosen: Option<String> = None;
+                card(ui, p, |ui| {
+                    ui.label(egui::RichText::new("Agent").color(p.ink).size(15.0).family(bold()));
+                    ui.add_space(8.0);
+                    field_label(ui, p, "Coding agent the buddy follows");
+                    ui.add_enabled_ui(!busy, |ui| {
+                        egui::ComboBox::from_id_source("agent_selector")
+                            .selected_text(current_name)
+                            .width((ui.available_width() - 8.0).max(160.0))
+                            .show_ui(ui, |ui| {
+                                for a in &agents {
+                                    if ui.selectable_label(a.id == current, &a.name).clicked()
+                                        && a.id != current
+                                    {
+                                        chosen = Some(a.id.clone());
+                                    }
+                                }
+                            });
+                    });
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Switching re-wires that agent’s hooks and re-themes your buddy.",
+                        )
+                        .color(p.muted)
+                        .size(11.0),
+                    );
+                });
+                if let Some(id) = chosen {
+                    self.send(Cmd::SetAgent { id });
+                }
+            }
+        }
+
         // App update banner — one-click in-place update where supported, else a
         // guided download. (Also shown at the top of Overview.)
         ui.add_space(10.0);
@@ -1164,7 +1402,7 @@ impl App {
                 egui::RichText::new("About")
                     .color(p.ink)
                     .size(15.0)
-                    .strong(),
+                    .family(bold()),
             );
             ui.add_space(8.0);
             metric(ui, p, "Version", env!("AGENT_BUDDY_VERSION"));
@@ -1173,6 +1411,18 @@ impl App {
                     metric(ui, p, "Buddy firmware", fw);
                 }
             }
+            ui.add_space(8.0);
+            ui.collapsing(
+                egui::RichText::new("Third-party licenses").color(p.muted).size(12.0),
+                |ui| {
+                    ui.label(
+                        egui::RichText::new(THIRD_PARTY_LICENSES)
+                            .color(p.muted)
+                            .monospace()
+                            .size(10.5),
+                    );
+                },
+            );
         });
 
         // Uninstall — removes everything Agent Buddy installed; gated behind an
@@ -1183,13 +1433,13 @@ impl App {
                 egui::RichText::new("Uninstall")
                     .color(p.ink)
                     .size(15.0)
-                    .strong(),
+                    .family(bold()),
             );
             ui.add_space(6.0);
             if self.pending_uninstall {
                 ui.label(
                     egui::RichText::new(
-                        "Removes the Claude Code hooks, the background gateway and its \
+                        "Removes your coding agent’s hooks, the background gateway and its \
                          service, the login item, the app launcher, and saved settings. \
                          Your buddy device and its firmware are not touched.",
                     )
@@ -1327,11 +1577,16 @@ fn build_tray() -> Result<tray_icon::TrayIcon, Box<dyn std::error::Error>> {
     menu.append(&MenuItem::with_id("uninstall", "Uninstall Agent Buddy…", true, None))?;
     menu.append(&MenuItem::with_id("quit", "Quit Agent Buddy", true, None))?;
 
-    let tray = tray_icon::TrayIconBuilder::new()
-        .with_tooltip("Agent Buddy")
+    let builder = tray_icon::TrayIconBuilder::new()
+        .with_tooltip(TrayState::Off.tooltip())
         .with_menu(Box::new(menu))
-        .with_icon(tray_icon_image())
-        .build()?;
+        .with_icon(tray_icon_image(TrayState::Off));
+    // On macOS a template image lets the system tint the glyph to match the menu
+    // bar (light/dark, reduce-transparency) — so it never looks pasted-on. State
+    // must read from shape, not colour, because the tint overrides our RGB.
+    #[cfg(target_os = "macos")]
+    let builder = builder.with_icon_as_template(true);
+    let tray = builder.build()?;
     Ok(tray)
 }
 
@@ -1370,25 +1625,45 @@ fn spawn_event_drain() {
     });
 }
 
-/// A 32×32 RGBA app glyph drawn in code (no asset to ship): a filled teal disc
-/// with a soft anti-aliased edge, matching the in-app brand mark.
+/// A 32×32 RGBA tray glyph drawn in code (no asset to ship) whose *shape* encodes
+/// connection state: Linked → filled disc, Idle → outline ring, Off → faint ring.
+/// On macOS it's a template (the system tints it), so state must read from shape;
+/// elsewhere it carries the brand teal (a muted grey when off), since those
+/// platforms show our colours as-is. Rim and ring edges are anti-aliased.
 #[cfg(not(target_os = "linux"))]
-fn tray_icon_image() -> tray_icon::Icon {
+fn tray_icon_image(state: TrayState) -> tray_icon::Icon {
     const N: u32 = 32;
     let mut rgba = vec![0u8; (N * N * 4) as usize];
     let c = (N as f32 - 1.0) / 2.0;
-    let r = c;
+    let r = c; // outer radius
+    let ring_inner = r - 5.0; // ~5px ring thickness when not filled
+    let filled = matches!(state, TrayState::Linked);
+    // Template images ignore RGB (alpha is the mask); colour only matters off-mac.
+    #[cfg(target_os = "macos")]
+    let (cr, cg, cb) = (0u8, 0u8, 0u8);
+    #[cfg(not(target_os = "macos"))]
+    let (cr, cg, cb): (u8, u8, u8) = match state {
+        TrayState::Off => (0x8A, 0x8F, 0x90), // muted grey
+        _ => (0x0D, 0x94, 0x88),              // brand teal
+    };
+    let max_alpha: f32 = if matches!(state, TrayState::Off) { 0.5 } else { 1.0 };
     for y in 0..N {
         for x in 0..N {
             let (dx, dy) = (x as f32 - c, y as f32 - c);
             let d = (dx * dx + dy * dy).sqrt();
-            if d <= r {
+            let outer = (r - d).clamp(0.0, 1.0); // 1 inside, 0 outside, AA at rim
+            let cov = if filled {
+                outer
+            } else {
+                // ring = inside the outer rim AND outside the inner rim.
+                outer.min((d - ring_inner).clamp(0.0, 1.0))
+            };
+            if cov > 0.0 {
                 let i = ((y * N + x) * 4) as usize;
-                let alpha = ((r - d) * 255.0).clamp(0.0, 255.0) as u8; // feather the rim
-                rgba[i] = 0x0D;
-                rgba[i + 1] = 0x94;
-                rgba[i + 2] = 0x88;
-                rgba[i + 3] = if d <= r - 1.0 { 255 } else { alpha };
+                rgba[i] = cr;
+                rgba[i + 1] = cg;
+                rgba[i + 2] = cb;
+                rgba[i + 3] = (cov * max_alpha * 255.0).round() as u8;
             }
         }
     }
@@ -1427,7 +1702,11 @@ fn spawn_worker(ctx: egui::Context, rx: Receiver<Cmd>, tx: Sender<Msg>) {
                         }
                     }
                 }
-                Ok(Cmd::UpdateFirmware { board, url }) => {
+                Ok(Cmd::UpdateFirmware {
+                    board,
+                    url,
+                    sha256_url,
+                }) => {
                     // Long-running with live progress, so it can't go through the
                     // one-shot `handle()`; stream OtaProgress, then the outcome.
                     // Source the image: when a URL was chosen, download the newer
@@ -1436,10 +1715,15 @@ fn spawn_worker(ctx: egui::Context, rx: Receiver<Cmd>, tx: Sender<Msg>) {
                     // bundled with this app.
                     let bytes: Result<Vec<u8>, String> = match &url {
                         Some(u) => {
-                            // Show the progress panel immediately while we fetch.
-                            let _ = tx.send(Msg::OtaProgress(0));
+                            // No byte count to bar against during the fetch — show
+                            // the phase and let the panel spin rather than parking
+                            // a misleading fake 0%.
+                            let _ =
+                                tx.send(Msg::OtaPhase("Downloading the latest firmware…".into()));
                             ctx.request_repaint();
-                            update::download_firmware(u)
+                            // Verify the download against the release's published
+                            // checksum (when present) before it's ever flashed.
+                            update::download_firmware_verified(u, sha256_url.as_deref())
                                 .map_err(|e| format!("couldn’t download firmware: {e}"))
                         }
                         None => match ota::bundled_firmware_path(&board) {
@@ -1452,22 +1736,22 @@ fn spawn_worker(ctx: egui::Context, rx: Receiver<Cmd>, tx: Sender<Msg>) {
                     };
                     let action = match bytes {
                         Ok(bytes) => {
+                            let _ = tx.send(Msg::OtaPhase("Sending to your buddy…".into()));
                             let txp = tx.clone();
                             match client::update_firmware(&bytes, &board, |pct| {
                                 let _ = txp.send(Msg::OtaProgress(pct));
+                                // The final ack triggers an on-device MD5 verify +
+                                // reboot the bar can't track — name that phase.
+                                if pct >= 100 {
+                                    let _ =
+                                        txp.send(Msg::OtaPhase("Verifying & rebooting…".into()));
+                                }
                                 ctx.request_repaint();
                             }) {
                                 Ok(()) => {
-                                    (true, "firmware updated — buddy is rebooting".to_string())
+                                    (true, "Firmware updated — your buddy is rebooting.".to_string())
                                 }
-                                Err(e) => (
-                                    false,
-                                    format!(
-                                        "{e}\nIf this keeps failing, allow “Agent Buddy” \
-                                         under System Settings > Privacy & Security > \
-                                         Local Network, then try again."
-                                    ),
-                                ),
+                                Err(e) => (false, format!("{e}\n{OTA_FAIL_HINT}")),
                             }
                         }
                         Err(e) => (false, e),
@@ -1517,22 +1801,30 @@ fn handle(cmd: Cmd) -> Option<(bool, String)> {
         }),
         Cmd::InstallStart => Some(
             match setup::daemon_exe_path().and_then(|exe| setup::service_install_and_start(&exe)) {
-                // Gateway is the must-have. Then wire the Claude Code hooks:
+                // Gateway is the must-have. Then wire the coding-agent hooks:
                 // without them the daemon runs but never receives session/usage
                 // events, so the buddy shows nothing — the CLI `setup` wires them
                 // and a GUI install must match (surfaced, not best-effort).
                 // Finally register this GUI as a clickable desktop app
-                // (best-effort — a failure there doesn't undo the install).
-                Ok(note) => {
-                    let hooks = match setup::wire_claude_hooks() {
-                        Ok(p) => format!("; wired Claude Code hooks into {}", p.display()),
-                        Err(e) => format!("; ⚠ could not wire Claude Code hooks: {e}"),
-                    };
-                    let app = setup::register_desktop_app()
-                        .map(|n| format!("; {n}"))
-                        .unwrap_or_default();
-                    (true, format!("{note}{hooks}{app}"))
-                }
+                // (best-effort — a failure there doesn't undo the install). The
+                // message stays customer-facing: success is a plain confirmation,
+                // not a dump of internal paths; only a hook failure needs detail.
+                Ok(_note) => match setup::wire_claude_hooks() {
+                    Ok(_) => {
+                        let _ = setup::register_desktop_app();
+                        (true, "Gateway installed and running — your buddy is connected.".into())
+                    }
+                    Err(e) => {
+                        let _ = setup::register_desktop_app();
+                        (
+                            true,
+                            format!(
+                                "Gateway installed and running, but it couldn’t connect your \
+                                 coding agent: {e}"
+                            ),
+                        )
+                    }
+                },
                 Err(e) => (false, e.to_string()),
             },
         ),
@@ -1546,6 +1838,10 @@ fn handle(cmd: Cmd) -> Option<(bool, String)> {
         }),
         Cmd::Stop => Some(match setup::service_stop() {
             Ok(note) => (true, note),
+            Err(e) => (false, e.to_string()),
+        }),
+        Cmd::SetAgent { id } => Some(match client::set_agent(&id) {
+            Ok(()) => (true, format!("switched to {id}")),
             Err(e) => (false, e.to_string()),
         }),
         // Startup maintenance: only speak up if it actually updated the gateway;
@@ -1570,11 +1866,10 @@ fn handle(cmd: Cmd) -> Option<(bool, String)> {
 /// generic "power it on" fallback.
 fn disconnected_hint(s: &StatusReport) -> String {
     if !s.bluetooth_available {
-        return "Turn on Bluetooth on this Mac, then wait a moment.".into();
+        return format!("Turn on Bluetooth on this {THIS_COMPUTER}, then wait a moment.");
     }
     if s.bluetooth_permitted == Some(false) {
-        return "Allow Bluetooth for Agent Buddy in System Settings → Privacy & Security → Bluetooth."
-            .into();
+        return format!("Allow Bluetooth for Agent Buddy in {BT_SETTINGS_PATH}.");
     }
     if let Some(err) = &s.last_connect_error {
         let low = err.to_lowercase();
@@ -1582,8 +1877,7 @@ fn disconnected_hint(s: &StatusReport) -> String {
             return "Confirm the 6-digit code shown on your buddy to finish pairing.".into();
         }
         if low.contains("permission") || low.contains("denied") || low.contains("unauthorized") {
-            return "Allow Bluetooth for Agent Buddy in System Settings > Privacy & Security > Bluetooth."
-                .into();
+            return format!("Allow Bluetooth for Agent Buddy in {BT_SETTINGS_PATH}.");
         }
         return format!("Last try: {err}. Power on your buddy and keep it nearby.");
     }
@@ -1726,12 +2020,25 @@ fn nav_item(
     resp.clicked()
 }
 
+/// The soft drop shadow that lifts cards and tiles off the page. A blurred,
+/// slightly-inset penumbra (negative spread keeps it from haloing past the
+/// rounded corners) tinted by the palette so light/dark each read right.
+fn card_shadow(p: &Pal) -> egui::epaint::Shadow {
+    egui::epaint::Shadow {
+        offset: egui::vec2(0.0, 2.0),
+        blur: 12.0,
+        spread: -2.0,
+        color: p.shadow,
+    }
+}
+
 /// A bordered rounded panel with padding — the building block of every section.
 fn card(ui: &mut egui::Ui, p: &Pal, add: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::none()
         .fill(p.card)
         .rounding(egui::Rounding::same(13.0))
         .stroke(egui::Stroke::new(1.0, p.hair))
+        .shadow(card_shadow(p))
         .inner_margin(egui::Margin::same(16.0))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -1745,6 +2052,7 @@ fn stat_tile(ui: &mut egui::Ui, p: &Pal, title: &str, value: &str, color: egui::
         .fill(p.card)
         .rounding(egui::Rounding::same(13.0))
         .stroke(egui::Stroke::new(1.0, p.hair))
+        .shadow(card_shadow(p))
         .inner_margin(egui::Margin::same(15.0))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -1752,13 +2060,13 @@ fn stat_tile(ui: &mut egui::Ui, p: &Pal, title: &str, value: &str, color: egui::
                 egui::RichText::new(title)
                     .color(p.muted)
                     .size(10.5)
-                    .strong(),
+                    .family(bold()),
             );
             ui.add_space(7.0);
             ui.horizontal(|ui| {
                 dot(ui, if ok { color } else { p.faint }, 4.0);
                 ui.add_space(6.0);
-                ui.label(egui::RichText::new(value).color(color).size(17.0).strong());
+                ui.label(egui::RichText::new(value).color(color).size(17.0).family(bold()));
             });
         });
 }
@@ -1779,23 +2087,27 @@ fn hairline(ui: &mut egui::Ui, p: &Pal) {
 fn status_row(ui: &mut egui::Ui, p: &Pal, label: &str, ok: bool, value: &str) {
     let color = if ok { p.good } else { p.muted };
     ui.horizontal(|ui| {
-        dot(ui, color, 4.5);
-        ui.add_space(7.0);
-        ui.label(egui::RichText::new(label).color(p.ink).size(14.5).strong());
+        ui.label(egui::RichText::new(label).color(p.ink).size(14.5).family(bold()));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             pill(ui, p, value, color);
         });
     });
 }
 
-/// A small rounded badge: tinted fill, saturated text.
+/// A small rounded badge: tinted fill, a leading status dot, and saturated text.
+/// The dot makes the state legible by shape+position, not color alone — it stays
+/// readable for red/green color-blind users and in grayscale.
 fn pill(ui: &mut egui::Ui, p: &Pal, text: &str, color: egui::Color32) {
     egui::Frame::none()
         .fill(mix(color, p.card, 0.86))
         .rounding(egui::Rounding::same(7.0))
-        .inner_margin(egui::Margin::symmetric(9.0, 3.0))
+        .inner_margin(egui::Margin::symmetric(9.0, 4.0))
         .show(ui, |ui| {
-            ui.label(egui::RichText::new(text).color(color).size(11.5).strong());
+            ui.horizontal(|ui| {
+                dot(ui, color, 3.5);
+                ui.add_space(5.0);
+                ui.label(egui::RichText::new(text).color(color).size(11.5).family(bold()));
+            });
         });
 }
 
@@ -1813,14 +2125,14 @@ fn metric_colored(ui: &mut egui::Ui, p: &Pal, label: &str, value: &str, color: e
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(label).color(p.muted).size(12.5));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(egui::RichText::new(value).color(color).size(12.5).strong());
+            ui.label(egui::RichText::new(value).color(color).size(12.5).family(bold()));
         });
     });
     ui.add_space(2.0);
 }
 
 fn field_label(ui: &mut egui::Ui, p: &Pal, text: &str) {
-    ui.label(egui::RichText::new(text).color(p.muted).size(11.0).strong());
+    ui.label(egui::RichText::new(text).color(p.muted).size(11.0).family(bold()));
     ui.add_space(4.0);
 }
 
@@ -1948,7 +2260,7 @@ fn fmt_sessions(s: &StatusReport) -> (String, bool) {
     (parts.join(" · "), true)
 }
 
-/// 12345 → "12,345"; big numbers → "1.2k" style stays readable.
+/// Group a count with thousands separators for readability: 12345 → "12,345".
 fn fmt_count(n: u64) -> String {
     let s = n.to_string();
     let bytes = s.as_bytes();

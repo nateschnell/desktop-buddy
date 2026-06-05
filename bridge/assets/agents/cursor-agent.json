@@ -1,0 +1,39 @@
+{
+  "id": "cursor-agent",
+  "name": "Cursor Agent",
+  "process_names": { "win": ["Cursor.exe"], "mac": ["Cursor"], "linux": ["cursor", "Cursor"] },
+  "event_source": "hook",
+  "event_map": {
+    "sessionStart": "idle",
+    "sessionEnd": "sleeping",
+    "beforeSubmitPrompt": "thinking",
+    "preToolUse": "working",
+    "postToolUse": "working",
+    "postToolUseFailure": "working",
+    "stop": "attention",
+    "stopFailure": "error",
+    "subagentStart": "juggling",
+    "subagentStop": "working",
+    "preCompact": "sweeping",
+    "afterAgentThought": "thinking"
+  },
+  "capabilities": {
+    "session_end": true,
+    "subagent": true
+  },
+  "install": {
+    "config_format": "cursor-hooks-json",
+    "target_path": { "home_rel": ".cursor/hooks.json" },
+    "stdin_format": "cursorHookJson",
+    "events": ["sessionStart", "sessionEnd", "beforeSubmitPrompt", "preToolUse", "postToolUse", "stop", "subagentStart", "subagentStop", "postToolUseFailure", "preCompact", "afterAgentThought"]
+  },
+  "palette": {
+    "body": "#5B8DEF",
+    "bg": "#000000",
+    "text": "#FFFFFF",
+    "text_dim": "#808080",
+    "ink": "#000000"
+  },
+  "panels": ["sessions", "subagents"],
+  "revision": 1
+}

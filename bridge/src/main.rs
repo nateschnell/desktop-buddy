@@ -30,10 +30,14 @@ enum Command {
         #[arg(long, default_value = "approve")]
         mock_decision: String,
     },
-    /// Internal: invoked by Claude Code for a hook event.
+    /// Internal: invoked by an agent harness for a hook event.
     Hook {
-        /// Claude Code hook event name (e.g. PreToolUse, Stop).
+        /// Hook event name (e.g. PreToolUse, Stop) as the harness names it.
         event: String,
+        /// Which agent harness this hook belongs to. Selects the profile used to
+        /// map the event. Absent ⇒ Claude Code (the legacy, default path).
+        #[arg(long)]
+        agent: Option<String>,
     },
     /// Wire hooks into Claude Code and install the background service.
     Setup {
@@ -110,7 +114,7 @@ async fn async_main() -> Result<()> {
             };
             daemon::run(mock).await
         }
-        Command::Hook { event } => hook::run(&event).await,
+        Command::Hook { event, agent } => hook::run(&event, agent.as_deref()).await,
         Command::Setup { tools, no_service } => setup::run(&tools, !no_service),
         Command::Uninstall => {
             println!("{}", setup::uninstall()?);
@@ -320,8 +324,9 @@ async fn ota(image: Option<String>) -> Result<()> {
             Err(e) => anyhow::bail!("could not reach the daemon: {e}"),
         }
         println!("✓ buddy is entering update mode — its screen shows \"Updating firmware\".");
-        println!("  Now push it over the air:");
-        println!("      cd firmware && pio run -e cyd-ota -t upload --upload-port buddy.local");
+        println!("  It's now listening for an image at buddy.local. Flash one with the");
+        println!("  desktop app's \"Update firmware\" button, or re-run with an image path:");
+        println!("      agent-buddy ota <firmware.bin>");
         return Ok(());
     };
 
@@ -375,9 +380,9 @@ fn report_sent(ssid: &str, joined: Option<&str>) {
             println!("  It will join the network and be reachable for OTA at buddy.local.");
         }
     }
-    println!("  Update with:");
-    println!("    pio run -e cyd-ota -t upload --upload-port buddy.local");
-    println!("  (or use the IP shown in the daemon log / your router if .local fails)");
+    println!("  Update its firmware from the desktop app's \"Update firmware\" button,");
+    println!("  or run:  agent-buddy ota <firmware.bin>");
+    println!("  (reachable at buddy.local once it joins; use the IP from the daemon log if .local fails)");
 }
 
 /// One round-trip to the daemon's IPC socket for an admin command.

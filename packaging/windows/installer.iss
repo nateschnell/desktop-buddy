@@ -47,6 +47,10 @@ Source: "{#StageDir}\agent-buddy.exe";     DestDir: "{app}"; Flags: ignoreversio
 ; app's one-click OTA has an image for whichever board connects.
 Source: "{#StageDir}\firmware*.bin";        DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#StageDir}\firmware*.version";     DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+; Bundled-asset license notice (Lucide/Feather icon font, ISC + MIT). Stage
+; bridge\assets\LICENSE into StageDir as THIRD_PARTY_LICENSES alongside the
+; binaries so the required notice ships with the install.
+Source: "{#StageDir}\THIRD_PARTY_LICENSES"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Icons]
 Name: "{group}\Agent Buddy";               Filename: "{app}\agent-buddy-app.exe"

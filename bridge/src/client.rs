@@ -135,6 +135,21 @@ pub fn provision_wifi(ssid: &str, pass: &str) -> Result<()> {
     }
 }
 
+/// Switch the active agent harness. The daemon re-wires hooks (uninstall old,
+/// install new), persists the choice, and re-themes the device. `Ok` even when
+/// no buddy is connected — the theme applies on the next connect.
+pub fn set_agent(id: &str) -> Result<()> {
+    let ep = endpoint()?;
+    let req = AdminRequest {
+        token: ep.token.clone(),
+        command: DeviceCommand::SetAgent { id: id.to_string() },
+    };
+    match round_trip::<_, AdminResponse>(&ep, &req)? {
+        AdminResponse::Ok { .. } | AdminResponse::NoDevice => Ok(()),
+        AdminResponse::Error { message } => Err(anyhow!(message)),
+    }
+}
+
 /// Run a full over-the-air firmware update: capture the buddy's IP, tell it to
 /// enter OTA mode (which frees the heap a flash needs by tearing down BLE + the
 /// UI), then push `image` over Wi-Fi via the built-in flasher. Blocking;

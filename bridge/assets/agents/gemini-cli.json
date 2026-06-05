@@ -1,0 +1,35 @@
+{
+  "id": "gemini-cli",
+  "name": "Gemini CLI",
+  "process_names": { "win": ["gemini.exe"], "mac": ["gemini"], "linux": ["gemini"] },
+  "event_source": "hook",
+  "event_map": {
+    "SessionStart": "idle",
+    "SessionEnd": "sleeping",
+    "BeforeAgent": "thinking",
+    "BeforeTool": "working",
+    "AfterTool": "working",
+    "AfterAgent": "idle",
+    "Notification": "notification",
+    "PreCompress": "idle"
+  },
+  "capabilities": {
+    "notification_hook": true,
+    "session_end": true
+  },
+  "install": {
+    "config_format": "gemini-settings-json",
+    "target_path": { "home_rel": ".gemini/settings.json" },
+    "stdin_format": "geminiHookJson",
+    "events": ["SessionStart", "SessionEnd", "BeforeAgent", "BeforeTool", "AfterTool", "AfterAgent", "Notification", "PreCompress"]
+  },
+  "palette": {
+    "body": "#4285F4",
+    "bg": "#000000",
+    "text": "#FFFFFF",
+    "text_dim": "#808080",
+    "ink": "#000000"
+  },
+  "panels": ["sessions"],
+  "revision": 1
+}

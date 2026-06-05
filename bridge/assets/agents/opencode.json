@@ -1,0 +1,36 @@
+{
+  "id": "opencode",
+  "name": "OpenCode",
+  "process_names": { "win": ["opencode.exe"], "mac": ["opencode"], "linux": ["opencode"] },
+  "event_source": "plugin-event",
+  "event_map": {
+    "SessionStart": "idle",
+    "SessionEnd": "sleeping",
+    "UserPromptSubmit": "thinking",
+    "PreToolUse": "working",
+    "PostToolUse": "working",
+    "PostToolUseFailure": "error",
+    "Stop": "attention",
+    "StopFailure": "error",
+    "PreCompact": "sweeping",
+    "PostCompact": "attention"
+  },
+  "capabilities": {
+    "session_end": true
+  },
+  "install": {
+    "config_format": "opencode-plugin",
+    "target_path": { "home_rel": "agents/opencode-plugin.json", "from_config_dir": true },
+    "stdin_format": "pascalCase",
+    "events": ["SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"]
+  },
+  "palette": {
+    "body": "#00C2A8",
+    "bg": "#000000",
+    "text": "#FFFFFF",
+    "text_dim": "#808080",
+    "ink": "#000000"
+  },
+  "panels": ["sessions"],
+  "revision": 1
+}

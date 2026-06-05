@@ -1,0 +1,43 @@
+{
+  "id": "claude-code",
+  "name": "Claude Code",
+  "process_names": { "win": ["claude.exe"], "mac": ["claude"], "linux": ["claude"] },
+  "event_source": "hook",
+  "event_map": {
+    "SessionStart": "idle",
+    "SessionEnd": "sleeping",
+    "UserPromptSubmit": "thinking",
+    "PreToolUse": "working",
+    "PostToolUse": "working",
+    "Stop": "attention",
+    "SubagentStart": "juggling",
+    "SubagentStop": "working",
+    "PreCompact": "sweeping",
+    "PostCompact": "attention",
+    "Notification": "notification",
+    "WorktreeCreate": "carrying"
+  },
+  "capabilities": {
+    "http_hook": true,
+    "permission_approval": true,
+    "notification_hook": true,
+    "session_end": true,
+    "subagent": true
+  },
+  "install": {
+    "config_format": "claude-code-compatible",
+    "target_path": { "home_rel": ".claude/settings.json" },
+    "stdin_format": "pascalCase",
+    "matcher": "Bash|Edit|Write|MultiEdit|NotebookEdit|WebFetch|WebSearch",
+    "events": ["PreToolUse", "SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "SubagentStop", "Notification"]
+  },
+  "palette": {
+    "body": "#C55531",
+    "bg": "#000000",
+    "text": "#FFFFFF",
+    "text_dim": "#808080",
+    "ink": "#000000"
+  },
+  "panels": ["tokens", "model", "context", "sessions", "subagents"],
+  "revision": 1
+}

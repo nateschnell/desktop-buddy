@@ -1,0 +1,29 @@
+{
+  "id": "kiro-cli",
+  "name": "Kiro CLI",
+  "process_names": { "win": ["kiro-cli.exe"], "mac": ["kiro-cli"], "linux": ["kiro-cli"] },
+  "event_source": "hook",
+  "event_map": {
+    "agentSpawn": "idle",
+    "userPromptSubmit": "thinking",
+    "preToolUse": "working",
+    "postToolUse": "working",
+    "stop": "attention"
+  },
+  "capabilities": {},
+  "install": {
+    "config_format": "kiro-agent-json",
+    "target_path": { "home_rel": ".kiro/agents/buddy.json" },
+    "stdin_format": "camelCase",
+    "events": ["agentSpawn", "userPromptSubmit", "preToolUse", "postToolUse", "stop"]
+  },
+  "palette": {
+    "body": "#7C4DFF",
+    "bg": "#000000",
+    "text": "#FFFFFF",
+    "text_dim": "#808080",
+    "ink": "#000000"
+  },
+  "panels": ["sessions"],
+  "revision": 1
+}

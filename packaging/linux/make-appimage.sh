@@ -14,13 +14,14 @@
 # used for the icon if present; otherwise a tiny embedded placeholder is used.
 set -euo pipefail
 
-BIN_DIR="" FW_DIR="" OUT="" VERSION="dev"
+BIN_DIR="" FW_DIR="" OUT="" VERSION="dev" ARCH="x86_64"
 while [ $# -gt 0 ]; do
   case "$1" in
     --bin-dir) BIN_DIR="$2"; shift 2;;
     --fw-dir)  FW_DIR="$2";  shift 2;;
     --out)     OUT="$2";     shift 2;;
     --version) VERSION="$2"; shift 2;;
+    --arch)    ARCH="$2";    shift 2;;  # x86_64 (default) or aarch64
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
@@ -43,6 +44,23 @@ if [ -n "$FW_DIR" ] && [ -d "$FW_DIR" ]; then
     echo "    bundled $(basename "$f")"
   done
   shopt -u nullglob
+fi
+
+# Ship the bundled-font license notices (Lucide/Feather icon font ISC + MIT, and
+# IBM Plex Sans OFL 1.1) so the required copyright notices travel with every copy,
+# not only compiled into the GUI binary. Resolved relative to this script's repo.
+ASSETS="$(cd "$(dirname "$0")/../.." && pwd)/bridge/assets"
+if [ -f "$ASSETS/LICENSE" ]; then
+  TPL="$APPDIR/usr/share/agent-buddy/THIRD_PARTY_LICENSES"
+  {
+    echo "=== Lucide icon font (lucide.ttf) ==="; echo
+    cat "$ASSETS/LICENSE"
+    if [ -f "$ASSETS/IBMPlexSans-LICENSE.txt" ]; then
+      echo; echo "=== IBM Plex Sans (IBMPlexSans-*.ttf) ==="; echo
+      cat "$ASSETS/IBMPlexSans-LICENSE.txt"
+    fi
+  } > "$TPL"
+  echo "    bundled THIRD_PARTY_LICENSES"
 fi
 
 # .desktop + icon are mandatory for AppImage. Icon name must match the .desktop
@@ -79,8 +97,10 @@ APPRUN
 chmod +x "$APPDIR/AppRun"
 
 mkdir -p "$OUT"
-OUTFILE="$OUT/Agent-Buddy-$VERSION-x86_64.AppImage"
+OUTFILE="$OUT/Agent-Buddy-$VERSION-$ARCH.AppImage"
 echo "==> building $OUTFILE"
-# --appimage-extract-and-run avoids needing FUSE in CI containers.
-ARCH=x86_64 appimagetool --appimage-extract-and-run "$APPDIR" "$OUTFILE"
+# --appimage-extract-and-run avoids needing FUSE in CI containers. ARCH tells
+# appimagetool which runtime to embed (x86_64 / aarch64); the caller passes the
+# arch matching the binaries in --bin-dir.
+ARCH="$ARCH" appimagetool --appimage-extract-and-run "$APPDIR" "$OUTFILE"
 echo "==> done: $OUTFILE"

@@ -1,0 +1,53 @@
+{
+  "id": "codex",
+  "name": "Codex CLI",
+  "process_names": { "win": ["codex.exe"], "mac": ["codex"], "linux": ["codex"] },
+  "event_source": "hook-log-poll",
+  "event_map": {
+    "SessionStart": "idle",
+    "UserPromptSubmit": "thinking",
+    "PreToolUse": "working",
+    "PermissionRequest": "notification",
+    "PostToolUse": "working",
+    "Stop": "codex-turn-end"
+  },
+  "log_event_map": {
+    "session_meta": "idle",
+    "event_msg:task_started": "thinking",
+    "event_msg:user_message": "thinking",
+    "event_msg:guardian_assessment": "working",
+    "event_msg:exec_command_end": "working",
+    "event_msg:patch_apply_end": "working",
+    "event_msg:custom_tool_call_output": "working",
+    "response_item:function_call": "working",
+    "response_item:custom_tool_call": "working",
+    "response_item:web_search_call": "working",
+    "event_msg:task_complete": "codex-turn-end",
+    "event_msg:context_compacted": "sweeping",
+    "event_msg:turn_aborted": "idle"
+  },
+  "capabilities": {
+    "permission_approval": false,
+    "interactive_bubble": false
+  },
+  "install": {
+    "config_format": "codex-hooks-json",
+    "target_path": { "home_rel": ".codex/hooks.json" },
+    "stdin_format": "codexHookJson",
+    "events": ["SessionStart", "UserPromptSubmit", "PreToolUse", "PermissionRequest", "PostToolUse", "Stop"]
+  },
+  "log_config": {
+    "session_dir": "~/.codex/sessions",
+    "file_pattern": "rollout-*.jsonl",
+    "poll_interval_ms": 1500
+  },
+  "palette": {
+    "body": "#10A37F",
+    "bg": "#000000",
+    "text": "#FFFFFF",
+    "text_dim": "#808080",
+    "ink": "#000000"
+  },
+  "panels": ["sessions", "model"],
+  "revision": 1
+}

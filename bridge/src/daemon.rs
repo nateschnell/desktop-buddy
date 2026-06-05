@@ -5,6 +5,7 @@
 //! (IPC accept loop, BLE notification pump, timers) feeds it [`Event`]s over
 //! an mpsc channel, so there are no locks around the state.
 
+use crate::agent::{self, AgentProfile};
 use crate::ble::BleLink;
 use crate::ipc::{
     AdminRequest, AdminResponse, DeviceCommand, Endpoint, FirmwareLatest, HookEvent, HookRequest,
@@ -232,19 +233,43 @@ pub async fn run(mock: Option<MockPolicy>) -> Result<()> {
     let mut config = Config::load()?;
     let mut state = SessionState::from_config(&config);
 
-    // --- Reconcile the Claude Code hooks. ---
+    // Agent profiles, loaded once (embedded defaults overlaid by release/user
+    // files). These drive which harness we ingest, the theme pushed to the
+    // device, and the app selector. (The NormState→device-telemetry collapse is
+    // structural in `ingest::normalized_to_hook_event`; `state_map.json` is the
+    // documented spec of that table, validated in agent.rs tests.) If the
+    // persisted active agent no longer resolves (e.g. a profile was removed),
+    // fall back to the default so we never run agent-less.
+    let profiles = agent::load_profiles();
+    if !profiles
+        .get(&config.active_agent)
+        .map(|p| p.supported())
+        .unwrap_or(false)
+    {
+        warn!(
+            "active agent {:?} has no supported profile; falling back to {}",
+            config.active_agent,
+            agent::DEFAULT_AGENT
+        );
+        config.active_agent = agent::DEFAULT_AGENT.to_string();
+    }
+    info!("active agent: {}", config.active_agent);
+
+    // --- Reconcile the active agent's hooks. ---
     // Bring our hook entries to exactly the canonical set for this installed
     // daemon every time it starts. This is the self-healing safety net: it
     // wires hooks an install never set up, restores one deleted by hand, repairs
     // a stale binary path, and adds/removes events when a new daemon version
     // changes the set — so a daemon restart (e.g. after an app update) is enough
     // to converge. A no-op writes nothing. Skipped under a mock device so
-    // test/dev runs don't touch the user's real settings.json.
+    // test/dev runs don't touch the user's real settings.json. Reconciles the
+    // *active* harness (Claude Code for the default agent); switching agents
+    // re-wires hooks via the SetAgent path.
     if mock.is_none() {
-        match crate::setup::ensure_claude_hooks() {
-            Ok(true) => info!("reconciled Claude Code hooks in settings.json"),
+        match crate::setup::ensure_active_agent_hooks(&config, &profiles) {
+            Ok(true) => info!("reconciled hooks for active agent {}", config.active_agent),
             Ok(false) => {}
-            Err(e) => warn!("could not reconcile Claude Code hooks: {e}"),
+            Err(e) => warn!("could not reconcile hooks: {e}"),
         }
     }
 
@@ -254,15 +279,34 @@ pub async fn run(mock: Option<MockPolicy>) -> Result<()> {
         .context("binding IPC socket")?;
     let port = listener.local_addr()?.port();
     let token = uuid::Uuid::new_v4().to_string();
+    // Loopback HTTP listener for plugin/extension harnesses (opencode, pi,
+    // openclaw, hermes) that POST events instead of spawning our hook command.
+    let http_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("binding HTTP ingest socket")?;
+    let http_port = http_listener.local_addr()?.port();
     write_endpoint(&Endpoint {
         port,
         token: token.clone(),
+        http_port: Some(http_port),
     })?;
-    info!("daemon IPC on 127.0.0.1:{port}");
+    info!("daemon IPC on 127.0.0.1:{port}, HTTP ingest on 127.0.0.1:{http_port}");
 
     let (ev_tx, mut ev_rx) = mpsc::channel::<Event>(256);
 
-    spawn_ipc_accept(listener, token, ev_tx.clone());
+    // Profiles shared with the always-on HTTP listener; the active agent is
+    // mirrored behind a lock so the listener only ingests the live harness.
+    let profiles_shared = Arc::new(profiles.clone());
+    let active_agent = Arc::new(Mutex::new(config.active_agent.clone()));
+
+    spawn_ipc_accept(listener, token.clone(), ev_tx.clone());
+    spawn_http_ingest(
+        http_listener,
+        token,
+        profiles_shared,
+        active_agent.clone(),
+        ev_tx.clone(),
+    );
     spawn_keepalive(ev_tx.clone());
     // Lets the owner loop nudge the update checker to poll immediately (on the
     // app being opened) instead of only on its 6h cadence — the fix for a
@@ -275,6 +319,10 @@ pub async fn run(mock: Option<MockPolicy>) -> Result<()> {
     if mock.is_none() {
         spawn_wake_watchdog();
     }
+
+    // JSONL log-poll task for the active agent (Codex). Restarted on switch.
+    let mut log_task: Option<tokio::task::JoinHandle<()>> =
+        start_log_poll(profiles.get(&config.active_agent), ev_tx.clone());
 
     if let Some(policy) = mock {
         // Virtual device: "connect" immediately, auto-answer prompts.
@@ -345,7 +393,7 @@ pub async fn run(mock: Option<MockPolicy>) -> Result<()> {
             Event::Connected(l) => {
                 link = Some(l.clone());
                 last_connect_error = None;
-                on_connect(&l, &config).await;
+                on_connect(&l, &config, profiles.get(&config.active_agent)).await;
                 push_heartbeat(&link, &state, prompts.front()).await;
             }
             Event::ConnectError(reason) => {
@@ -354,23 +402,38 @@ pub async fn run(mock: Option<MockPolicy>) -> Result<()> {
             }
             Event::Disconnected => {
                 warn!("device disconnected");
+                // Resolve any parked Wi-Fi request before clearing last_net, and
+                // mirror resolve_wifi_deadline's phase logic: in AwaitingJoin the
+                // creds are already confirmed-stored (the firmware acked NVS
+                // persistence), so a disconnect in the join grace window is a
+                // success, not a failure — only AwaitingAck is a real failure.
+                if let Some(w) = pending_wifi.take() {
+                    match w.phase {
+                        WifiPhase::AwaitingJoin => {
+                            let joined = last_net.as_ref().map(|(s, _, _)| s.clone());
+                            let _ = w.responder.send(AdminResponse::Ok { joined });
+                        }
+                        WifiPhase::AwaitingAck => {
+                            let _ = w.responder.send(AdminResponse::Error {
+                                message: "the buddy disconnected before confirming Wi-Fi — try again"
+                                    .into(),
+                            });
+                        }
+                    }
+                }
                 last_net = None;
                 last_fw = None;
                 last_board = None;
                 drop_link(&mut link, &mut prompts, &mut state);
-                // A parked Wi-Fi request can never be confirmed now — fail it
-                // rather than leave the CLI/app hanging until its own timeout.
-                if let Some(w) = pending_wifi.take() {
-                    let _ = w.responder.send(AdminResponse::Error {
-                        message: "the buddy disconnected before confirming Wi-Fi — try again"
-                            .into(),
-                    });
-                }
             }
             Event::Keepalive => {
                 if config_token_day_changed(&mut config, &mut state) {
                     let _ = config.save();
                 }
+                // Evict idle sessions from harnesses that never emit a
+                // terminating event (e.g. Codex), so the maps + counts can't
+                // grow unbounded over a long uptime. ~10min idle window.
+                state.prune_idle(local_now().0, 600);
                 // Proactively notice a vanished buddy: poll the live connection
                 // state rather than waiting for the notify stream to close or a
                 // heartbeat write to fail (both bounded by the BLE supervision
@@ -508,6 +571,35 @@ pub async fn run(mock: Option<MockPolicy>) -> Result<()> {
                             }
                         }
                     }
+                    DeviceCommand::SetAgent { id } => {
+                        // Switch the active harness. Validate against loaded
+                        // profiles, (re)install hooks for the new agent, persist
+                        // the choice, and push its theme to the device. A
+                        // disconnected device still updates config + hooks; the
+                        // theme applies on next connect.
+                        match switch_agent(&mut config, &profiles, &id) {
+                            Ok(()) => {
+                                // Mirror the active agent for the HTTP listener,
+                                // and swap the log-poll task to the new agent.
+                                if let Ok(mut a) = active_agent.lock() {
+                                    *a = id.clone();
+                                }
+                                if let Some(h) = log_task.take() {
+                                    h.abort();
+                                }
+                                log_task = start_log_poll(profiles.get(&id), ev_tx.clone());
+                                if let Some(l) = &link {
+                                    push_theme(l, profiles.get(&id)).await;
+                                }
+                                let _ = responder.send(AdminResponse::Ok { joined: None });
+                            }
+                            Err(e) => {
+                                let _ = responder.send(AdminResponse::Error {
+                                    message: e.to_string(),
+                                });
+                            }
+                        }
+                    }
                 }
             }
             Event::UpdateInfo { app, firmware } => {
@@ -535,12 +627,53 @@ pub async fn run(mock: Option<MockPolicy>) -> Result<()> {
                         last_connect_error.as_deref(),
                         latest_update.as_ref(),
                         &firmware_latest,
+                        &profiles,
                     )),
                 };
                 let _ = responder.send(resp);
             }
         }
     }
+    Ok(())
+}
+
+/// Switch the active agent harness: validate the id, swap the installed hooks
+/// (uninstall the old harness's, install the new one's), and persist the choice.
+/// The theme push + ingestion-task swap are handled by the caller (it owns the
+/// link + task handles). Returns an error for an unknown id.
+fn switch_agent(
+    config: &mut Config,
+    profiles: &HashMap<String, AgentProfile>,
+    id: &str,
+) -> Result<()> {
+    let new = profiles
+        .get(id)
+        .ok_or_else(|| anyhow::anyhow!("unknown agent {id:?}"))?;
+    if !new.supported() {
+        return Err(anyhow::anyhow!(
+            "agent {id:?} uses an unsupported config format and can't be activated"
+        ));
+    }
+    if config.active_agent == id {
+        return Ok(()); // already active — nothing to do
+    }
+    let exe = crate::setup::daemon_exe_path().unwrap_or_else(|_| "agent-buddy".to_string());
+    // Install the NEW agent's hooks first; if this fails the OLD agent's hooks
+    // are still intact and the buddy keeps working.
+    crate::setup::install_profile(new, &exe)
+        .with_context(|| format!("installing {id} hooks"))?;
+    // Only after the new install succeeds, remove the old agent's hooks
+    // (best-effort; any stale/duplicate entries are reconciled on next startup).
+    if config.active_agent != id {
+        if let Some(old) = profiles.get(&config.active_agent) {
+            if let Err(e) = crate::setup::uninstall_profile(old, &exe) {
+                warn!("uninstalling {} hooks failed: {e}", old.id);
+            }
+        }
+    }
+    config.active_agent = id.to_string();
+    config.save().context("saving active agent")?;
+    info!("switched active agent to {id}");
     Ok(())
 }
 
@@ -556,10 +689,13 @@ fn build_status(
     last_connect_error: Option<&str>,
     latest_update: Option<&UpdateStatus>,
     firmware_latest: &HashMap<String, FirmwareLatest>,
+    profiles: &HashMap<String, AgentProfile>,
 ) -> StatusReport {
     StatusReport {
         device_connected,
         owner: config.owner.clone(),
+        active_agent: config.active_agent.clone(),
+        available_agents: agent::list_agents(profiles),
         tokens_today: state.tokens_today,
         tokens_total: state.tokens,
         sessions_total: state.total(),
@@ -615,9 +751,36 @@ fn connect_error_permission_hint(reason: Option<&str>) -> Option<bool> {
     }
 }
 
-/// On a fresh connection, sync time + owner so the device clock and greeting
-/// are correct.
-async fn on_connect(link: &Link, config: &Config) {
+/// Build the device theme command for an agent profile (colors → RGB565,
+/// panels/caps → bitmasks, pack id).
+fn theme_cmd(p: &AgentProfile) -> OutboundCmd {
+    OutboundCmd::Theme {
+        id: p.id.clone(),
+        label: p.name.clone(),
+        pal: p.palette.base_rgb565(),
+        hot: p.palette.hot.rgb565(),
+        panel: p.palette.panel.rgb565(),
+        sel: p.palette.sel.rgb565(),
+        ok: p.palette.ok.rgb565(),
+        panels: p.panel_bits(),
+        caps: p.capabilities.bits(),
+        pack: Some(p.pack().to_string()),
+    }
+}
+
+/// Push the active agent's theme to the device (bounded like the other syncs).
+/// No-op when the profile is missing — the device keeps its last/default theme.
+async fn push_theme(link: &Link, profile: Option<&AgentProfile>) {
+    let Some(p) = profile else { return };
+    let cmd = theme_cmd(p);
+    if let Ok(Err(e)) = tokio::time::timeout(Duration::from_secs(2), link.send(&cmd)).await {
+        warn!("theme sync failed: {e}");
+    }
+}
+
+/// On a fresh connection, sync time + owner + theme so the device clock,
+/// greeting, and per-agent palette/animation are correct from the first frame.
+async fn on_connect(link: &Link, config: &Config, profile: Option<&AgentProfile>) {
     let (epoch, offset, _today) = local_now();
     let time = TimeSync {
         time: (epoch, offset),
@@ -633,6 +796,7 @@ async fn on_connect(link: &Link, config: &Config) {
     if let Ok(Err(e)) = send_owner.await {
         warn!("owner sync failed: {e}");
     }
+    push_theme(link, profile).await;
 }
 
 /// Translate a hook event into state changes and (for PermissionRequest) a
@@ -646,6 +810,9 @@ async fn handle_hook(
     prompts: &mut VecDeque<Pending>,
     ev_tx: &mpsc::Sender<Event>,
 ) {
+    // Stamp the session's wall-clock last-seen so idle eviction (Keepalive) can
+    // drop sessions from harnesses that never emit a terminating event.
+    state.touch(event.session_id(), local_now().0);
     match event {
         HookEvent::SessionStart { session_id, cwd } => {
             state.session_started(&session_id);
@@ -1021,6 +1188,269 @@ async fn push_heartbeat(link: &Option<Link>, state: &SessionState, front: Option
 // Background tasks
 // ---------------------------------------------------------------------------
 
+/// Expand a leading `~/` to the user's home directory.
+fn expand_tilde(p: &str) -> std::path::PathBuf {
+    if let Some(rest) = p.strip_prefix("~/") {
+        if let Some(b) = directories::BaseDirs::new() {
+            return b.home_dir().join(rest);
+        }
+    }
+    std::path::PathBuf::from(p)
+}
+
+/// A trivial single-`*` glob match (`rollout-*.jsonl`), enough for log patterns.
+fn glob_match(name: &str, pat: &str) -> bool {
+    match pat.split_once('*') {
+        Some((pre, suf)) => {
+            name.len() >= pre.len() + suf.len() && name.starts_with(pre) && name.ends_with(suf)
+        }
+        None => name == pat,
+    }
+}
+
+/// Spawn the JSONL log-poll task for `profile` if it declares a `log_config`
+/// (Codex). Returns the handle so the owner loop can abort it on agent switch.
+/// `None` when the agent doesn't log-poll.
+fn start_log_poll(
+    profile: Option<&AgentProfile>,
+    ev_tx: mpsc::Sender<Event>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let profile = profile?;
+    profile.log_config.as_ref()?;
+    let profile = profile.clone();
+    Some(tokio::spawn(log_poll_loop(profile, ev_tx)))
+}
+
+/// Tail a harness's rolling JSONL session logs, classify each new line via the
+/// profile's `log_event_map`, and feed the resulting state into the owner loop.
+/// Only ingests lines written *after* the daemon started (or after a file first
+/// appears) so launching doesn't replay the whole session history.
+async fn log_poll_loop(profile: AgentProfile, ev_tx: mpsc::Sender<Event>) {
+    let cfg = profile.log_config.clone().expect("log_config present");
+    let dir = expand_tilde(&cfg.session_dir);
+    let interval = Duration::from_millis(cfg.poll_interval_ms.max(250));
+    // Per file: byte offset already consumed + the session cwd (recovered from
+    // the file's session_meta line, which only appears once).
+    let mut offsets: HashMap<std::path::PathBuf, (usize, String)> = HashMap::new();
+    let mut first_cycle = true;
+    loop {
+        tokio::time::sleep(interval).await;
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue, // dir not there yet — keep waiting
+        };
+        let mut seen: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !glob_match(&name, &cfg.file_pattern) {
+                continue;
+            }
+            let path = entry.path();
+            seen.insert(path.clone());
+            let data = match std::fs::read(&path) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            // A stable session id per rollout file: its trailing UUID (the last
+            // 5 hyphen-delimited segments of the stem), else the stem itself.
+            let session_id = format!("{}:{}", profile.id, codex_session_id(&path));
+            // Seed offset: pre-existing files at startup start at end (no replay);
+            // files first seen later are new sessions → start at 0.
+            let entry_state = offsets
+                .entry(path.clone())
+                .or_insert_with(|| (if first_cycle { data.len() } else { 0 }, String::new()));
+            if data.len() < entry_state.0 {
+                entry_state.0 = 0; // truncated/rotated
+            }
+            // Process only complete lines; advance offset past the last newline.
+            let chunk = &data[entry_state.0..];
+            let Some(last_nl) = chunk.iter().rposition(|&b| b == b'\n') else {
+                continue;
+            };
+            let text = String::from_utf8_lossy(&chunk[..=last_nl]);
+            for line in text.lines() {
+                let (norm, line_cwd) = crate::ingest::classify_log_line(&profile, line);
+                if let Some(cwd) = line_cwd {
+                    entry_state.1 = cwd; // cache the session cwd for later lines
+                }
+                if let Some(norm) = norm {
+                    if let Some(ev) = crate::ingest::normalized_to_hook_event(
+                        norm,
+                        session_id.clone(),
+                        entry_state.1.clone(),
+                        None,
+                        profile.capabilities.permission_approval,
+                    ) {
+                        let (tx, _rx) = oneshot::channel();
+                        if ev_tx.send(Event::Hook(ev, tx)).await.is_err() {
+                            return; // owner loop gone
+                        }
+                    }
+                }
+            }
+            entry_state.0 += last_nl + 1;
+        }
+        // Drop offsets for files that no longer exist so they don't accumulate
+        // over a long uptime (rotated/deleted rollouts).
+        offsets.retain(|p, _| seen.contains(p));
+        first_cycle = false;
+    }
+}
+
+/// Derive a stable session id from a Codex rollout filename: the trailing UUID
+/// (last 5 hyphen-delimited segments of the file stem, e.g.
+/// `rollout-2026-06-05T...-<8>-<4>-<4>-<4>-<12>`), falling back to the whole stem.
+fn codex_session_id(path: &std::path::Path) -> String {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("session");
+    let segs: Vec<&str> = stem.split('-').collect();
+    if segs.len() >= 5 {
+        segs[segs.len() - 5..].join("-")
+    } else {
+        stem.to_string()
+    }
+}
+
+/// Accept loopback HTTP POSTs from plugin/extension harnesses and feed mapped
+/// events into the owner loop. Stateless per-request: the POST body names its
+/// own `agent` + `event`; we only ingest when that agent is the *active* one
+/// (mirrored in `active`) so a background harness can't drive the one device.
+fn spawn_http_ingest(
+    listener: TcpListener,
+    token: String,
+    profiles: Arc<HashMap<String, AgentProfile>>,
+    active: Arc<Mutex<String>>,
+    ev_tx: mpsc::Sender<Event>,
+) {
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let token = token.clone();
+                    let profiles = profiles.clone();
+                    let active = active.clone();
+                    let ev_tx = ev_tx.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = serve_http_conn(stream, &token, profiles, active, &ev_tx).await
+                        {
+                            debug!("http ingest conn error: {e}");
+                        }
+                    });
+                }
+                Err(e) => {
+                    warn!("http ingest accept failed: {e}");
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+        }
+    });
+}
+
+/// Handle one HTTP request: read headers + body, check the token, map the event,
+/// and post it to the owner loop. Always replies `200 ok` so a plugin never
+/// hangs; gating/ignoring happens silently.
+/// Upper bound on bytes read from a single local IPC/HTTP connection: comfortably
+/// above the largest legitimate request (a ≤64KB body plus small headers/JSON),
+/// but a hard ceiling so a misbehaving local client can't grow the daemon's heap.
+const IPC_MAX_CONN_BYTES: u64 = 256 * 1024;
+
+async fn serve_http_conn(
+    stream: TcpStream,
+    token: &str,
+    profiles: Arc<HashMap<String, AgentProfile>>,
+    active: Arc<Mutex<String>>,
+    ev_tx: &mpsc::Sender<Event>,
+) -> Result<()> {
+    let (read_half, mut write_half) = stream.into_split();
+    // Bound the whole connection's bytes so a local client can't stream unbounded
+    // data into the daemon's heap (the body is separately capped at 64KB; this
+    // caps the header lines too). Loopback + token-gated, so this is just defense.
+    let mut reader = BufReader::new(tokio::io::AsyncReadExt::take(read_half, IPC_MAX_CONN_BYTES));
+
+    // Request line + headers.
+    let mut content_length = 0usize;
+    let mut req_token = String::new();
+    let mut line = String::new();
+    // First line (method/path) — read and ignore.
+    reader.read_line(&mut line).await?;
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).await?;
+        if n == 0 || line == "\r\n" || line == "\n" {
+            break; // end of headers
+        }
+        let lower = line.to_ascii_lowercase();
+        if let Some(v) = lower.strip_prefix("content-length:") {
+            content_length = v.trim().parse().unwrap_or(0);
+        } else if let Some(v) = lower.strip_prefix("x-buddy-token:") {
+            req_token = v.trim().to_string();
+        }
+    }
+
+    let mut body = vec![0u8; content_length.min(64 * 1024)];
+    if !body.is_empty() {
+        tokio::io::AsyncReadExt::read_exact(&mut reader, &mut body).await?;
+    }
+
+    let reply = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+    let _ = write_half.write_all(reply).await;
+    let _ = write_half.flush().await;
+
+    // Token may ride a header or the JSON body; require a match either way.
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let body_token = payload.get("token").and_then(|v| v.as_str()).unwrap_or("");
+    if req_token != token && body_token != token {
+        debug!("http ingest: bad token, ignoring");
+        return Ok(());
+    }
+
+    let agent_id = payload
+        .get("agent")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    // Only the active agent drives the device.
+    if active.lock().map(|a| *a != agent_id).unwrap_or(true) {
+        return Ok(());
+    }
+    let Some(profile) = profiles.get(&agent_id) else {
+        return Ok(());
+    };
+    let name = crate::ingest::event_name(
+        payload.get("event").and_then(|v| v.as_str()).unwrap_or(""),
+        &payload,
+    );
+    // Namespace the session id per agent so distinct harnesses (and the
+    // synthetic "default") can't alias the same SessionState entry.
+    let mut payload = payload;
+    let raw_sid = crate::ingest::session_id(&payload);
+    let namespaced = namespace_session(&agent_id, &raw_sid);
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("session_id".to_string(), Value::String(namespaced));
+    }
+    if let Some(ev) = crate::ingest::map_hook_event(profile, &name, &payload) {
+        let (tx, _rx) = oneshot::channel();
+        let _ = ev_tx.send(Event::Hook(ev, tx)).await;
+    }
+    Ok(())
+}
+
+/// Prefix a raw session id with its agent so cross-harness ids never alias the
+/// shared SessionState map. Idempotent: an already-prefixed id is left as-is.
+fn namespace_session(agent_id: &str, raw: &str) -> String {
+    let prefix = format!("{agent_id}:");
+    if raw.starts_with(&prefix) {
+        raw.to_string()
+    } else {
+        format!("{agent_id}:{raw}")
+    }
+}
+
+use serde_json::Value;
+
 /// Accept hook connections; each sends one [`HookRequest`] line and reads one
 /// [`HookResponse`] line.
 fn spawn_ipc_accept(listener: TcpListener, token: String, ev_tx: mpsc::Sender<Event>) {
@@ -1051,7 +1481,9 @@ async fn serve_hook_conn(
     ev_tx: &mpsc::Sender<Event>,
 ) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
+    // Cap total bytes so a local client can't stream gigabytes into one line
+    // within the read timeout (loopback + token-gated; defense in depth).
+    let mut reader = BufReader::new(tokio::io::AsyncReadExt::take(read_half, IPC_MAX_CONN_BYTES));
     let mut line = String::new();
     // Bound the read so a connected-but-silent client can't park a task.
     tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
@@ -1467,10 +1899,17 @@ fn spawn_update_checker(
                     // Newest firmware per board, version + download URL.
                     let mut firmware: HashMap<String, FirmwareLatest> = HashMap::new();
                     for board in crate::update::firmware_boards(&releases) {
-                        if let Some((version, url)) =
+                        if let Some((version, url, sha256_url)) =
                             crate::update::latest_firmware(&releases, &board)
                         {
-                            firmware.insert(board, FirmwareLatest { version, url });
+                            firmware.insert(
+                                board,
+                                FirmwareLatest {
+                                    version,
+                                    url,
+                                    sha256_url,
+                                },
+                            );
                         }
                     }
                     if ev_tx

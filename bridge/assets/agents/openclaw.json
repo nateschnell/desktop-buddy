@@ -1,0 +1,36 @@
+{
+  "id": "openclaw",
+  "name": "OpenClaw",
+  "process_names": { "win": [], "mac": [], "linux": [] },
+  "event_source": "plugin-event",
+  "event_map": {
+    "SessionStart": "idle",
+    "UserPromptSubmit": "thinking",
+    "PreToolUse": "working",
+    "PostToolUse": "working",
+    "PostToolUseFailure": "error",
+    "Stop": "attention",
+    "StopFailure": "error",
+    "PreCompact": "sweeping",
+    "PostCompact": "attention",
+    "SessionEnd": "sleeping"
+  },
+  "capabilities": {
+    "session_end": true
+  },
+  "install": {
+    "config_format": "openclaw-plugin",
+    "target_path": { "home_rel": "agents/openclaw-plugin.json", "from_config_dir": true },
+    "stdin_format": "pascalCase",
+    "events": ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "SessionEnd"]
+  },
+  "palette": {
+    "body": "#FF7A18",
+    "bg": "#000000",
+    "text": "#FFFFFF",
+    "text_dim": "#808080",
+    "ink": "#000000"
+  },
+  "panels": ["sessions"],
+  "revision": 1
+}

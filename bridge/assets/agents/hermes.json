@@ -1,0 +1,34 @@
+{
+  "id": "hermes",
+  "name": "Hermes Agent",
+  "process_names": { "win": ["hermes.exe"], "mac": ["hermes"], "linux": ["hermes"] },
+  "event_source": "plugin-event",
+  "event_map": {
+    "SessionStart": "idle",
+    "UserPromptSubmit": "thinking",
+    "PreToolUse": "working",
+    "PostToolUse": "working",
+    "PostToolUseFailure": "error",
+    "Stop": "attention",
+    "StopFailure": "error",
+    "SessionEnd": "sleeping"
+  },
+  "capabilities": {
+    "session_end": true
+  },
+  "install": {
+    "config_format": "hermes-plugin",
+    "target_path": { "home_rel": "agents/hermes-plugin.json", "from_config_dir": true },
+    "stdin_format": "pascalCase",
+    "events": ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "SessionEnd"]
+  },
+  "palette": {
+    "body": "#C99A3B",
+    "bg": "#000000",
+    "text": "#FFFFFF",
+    "text_dim": "#808080",
+    "ink": "#000000"
+  },
+  "panels": ["sessions"],
+  "revision": 1
+}

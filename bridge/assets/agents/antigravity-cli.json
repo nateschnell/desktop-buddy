@@ -1,0 +1,33 @@
+{
+  "id": "antigravity-cli",
+  "name": "Antigravity CLI",
+  "process_names": { "win": ["agy.exe"], "mac": ["agy"], "linux": ["agy"] },
+  "event_source": "hook",
+  "event_map": {
+    "PreInvocation": "thinking",
+    "PostToolUse": "working",
+    "PostToolUseFailure": "error",
+    "PostInvocation": "idle",
+    "Stop": "attention",
+    "StopFailure": "error"
+  },
+  "capabilities": {
+    "session_end": true,
+    "subagent": true
+  },
+  "install": {
+    "config_format": "antigravity-hooks-json",
+    "target_path": { "home_rel": ".gemini/config/hooks.json" },
+    "stdin_format": "antigravityHookJson",
+    "events": ["PreInvocation", "PostToolUse", "PostInvocation", "Stop"]
+  },
+  "palette": {
+    "body": "#1A73E8",
+    "bg": "#000000",
+    "text": "#FFFFFF",
+    "text_dim": "#808080",
+    "ink": "#000000"
+  },
+  "panels": ["sessions", "subagents"],
+  "revision": 1
+}

@@ -14,6 +14,11 @@
 #   AGENT_BUDDY_NO_SETUP=1  install the binary only; skip `setup`
 #   AGENT_BUDDY_UNINSTALL=1 remove everything (hooks, daemon, service, state)
 set -eu
+# Enable pipefail where the shell running us supports it (not POSIX, but bash/
+# zsh/most dash builds do) so a failed stage in a pipeline aborts rather than
+# being masked by the last command's success.
+# shellcheck disable=SC3040
+( set -o pipefail 2>/dev/null ) && set -o pipefail || true
 
 REPO="${AGENT_BUDDY_REPO:-nateschnell/agent-buddy}"
 VERSION="${AGENT_BUDDY_VERSION:-latest}"
@@ -21,6 +26,18 @@ BINDIR="${AGENT_BUDDY_BINDIR:-$HOME/.local/bin}"
 
 say()  { printf '\033[1m%s\033[0m\n' "$*"; }
 err()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# sha256 of a file, using whichever tool this OS ships (Linux: sha256sum,
+# macOS: shasum). Used to verify the download against the release manifest.
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    err "need sha256sum or shasum to verify the download"
+  fi
+}
 
 # --- uninstall mode --------------------------------------------------------
 # Reverse everything: prefer the installed binary's own `uninstall` (it knows
@@ -55,13 +72,19 @@ case "$os" in
   *) err "unsupported OS: $os (use install.ps1 on Windows)" ;;
 esac
 
-# --- resolve download URL --------------------------------------------------
+# --- preflight -------------------------------------------------------------
+command -v curl >/dev/null 2>&1 || err "curl is required but was not found"
+command -v tar  >/dev/null 2>&1 || err "tar is required but was not found"
+
+# --- resolve download URLs -------------------------------------------------
 asset="agent-buddy-${target}.tar.gz"
 if [ "$VERSION" = "latest" ]; then
-  url="https://github.com/${REPO}/releases/latest/download/${asset}"
+  base="https://github.com/${REPO}/releases/latest/download"
 else
-  url="https://github.com/${REPO}/releases/download/${VERSION}/${asset}"
+  base="https://github.com/${REPO}/releases/download/${VERSION}"
 fi
+url="${base}/${asset}"
+sums_url="${base}/SHA256SUMS"
 
 say "Installing agent-buddy for ${target}…"
 tmp="$(mktemp -d)"
@@ -73,7 +96,27 @@ if ! curl -fsSL "$url" -o "$tmp/$asset"; then
    cd bridge && cargo build --release && cp target/release/agent-buddy \"$BINDIR/\")"
 fi
 
-tar -xzf "$tmp/$asset" -C "$tmp"
+# Verify the archive against the release's published SHA256SUMS before trusting
+# it — catches a corrupt/partial download or a tampered asset. Fail closed: an
+# unverifiable download is not installed.
+if ! curl -fsSL "$sums_url" -o "$tmp/SHA256SUMS"; then
+  err "could not fetch SHA256SUMS from the release — refusing to install an unverified binary"
+fi
+expected="$(awk -v f="$asset" '$2 == f || $2 == "*" f { print $1; exit }' "$tmp/SHA256SUMS")"
+[ -n "$expected" ] || err "SHA256SUMS has no entry for $asset"
+actual="$(sha256_of "$tmp/$asset")"
+if [ "$expected" != "$actual" ]; then
+  err "checksum mismatch for $asset
+  expected: $expected
+  actual:   $actual
+Refusing to install. Re-download or report this."
+fi
+say "✓ verified $asset (sha256)"
+
+if ! tar -xzf "$tmp/$asset" -C "$tmp"; then
+  err "failed to extract $asset (corrupt download?)"
+fi
+[ -f "$tmp/agent-buddy" ] || err "archive did not contain the agent-buddy binary"
 mkdir -p "$BINDIR"
 install -m 0755 "$tmp/agent-buddy" "$BINDIR/agent-buddy"
 say "✓ installed $BINDIR/agent-buddy"

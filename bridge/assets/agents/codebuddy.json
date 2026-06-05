@@ -1,0 +1,39 @@
+{
+  "id": "codebuddy",
+  "name": "CodeBuddy",
+  "process_names": { "win": ["CodeBuddy.exe", "codebuddy.exe"], "mac": ["CodeBuddy"], "linux": ["codebuddy", "CodeBuddy"] },
+  "event_source": "hook",
+  "event_map": {
+    "SessionStart": "idle",
+    "SessionEnd": "sleeping",
+    "UserPromptSubmit": "thinking",
+    "PreToolUse": "working",
+    "PostToolUse": "working",
+    "Stop": "attention",
+    "PermissionRequest": "attention",
+    "Notification": "notification",
+    "PreCompact": "sweeping"
+  },
+  "capabilities": {
+    "http_hook": true,
+    "permission_approval": true,
+    "notification_hook": true,
+    "session_end": true
+  },
+  "install": {
+    "config_format": "claude-code-compatible",
+    "target_path": { "home_rel": ".codebuddy/settings.json" },
+    "stdin_format": "claudeCodeHookJson",
+    "matcher": "Bash|Edit|Write|MultiEdit",
+    "events": ["SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "Notification", "PreCompact"]
+  },
+  "palette": {
+    "body": "#2B7BE4",
+    "bg": "#000000",
+    "text": "#FFFFFF",
+    "text_dim": "#808080",
+    "ink": "#000000"
+  },
+  "panels": ["sessions"],
+  "revision": 1
+}

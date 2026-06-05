@@ -68,6 +68,24 @@ if [ -n "$FW_DIR" ] && [ -d "$FW_DIR" ]; then
   shopt -u nullglob
 fi
 
+# Ship the bundled-font license notices (Lucide/Feather icon font ISC + MIT, and
+# IBM Plex Sans OFL 1.1) alongside the binary so the required copyright notices
+# travel with every copy, not only compiled into the GUI. Resolved relative to
+# this script's repo path.
+ASSETS="$(cd "$(dirname "$0")/../.." && pwd)/bridge/assets"
+if [ -f "$ASSETS/LICENSE" ]; then
+  TPL="$CONTENTS/Resources/THIRD_PARTY_LICENSES"
+  {
+    echo "=== Lucide icon font (lucide.ttf) ==="; echo
+    cat "$ASSETS/LICENSE"
+    if [ -f "$ASSETS/IBMPlexSans-LICENSE.txt" ]; then
+      echo; echo "=== IBM Plex Sans (IBMPlexSans-*.ttf) ==="; echo
+      cat "$ASSETS/IBMPlexSans-LICENSE.txt"
+    fi
+  } > "$TPL"
+  echo "    bundled THIRD_PARTY_LICENSES"
+fi
+
 # Info.plist mirrors setup.rs::install_desktop_launcher so the bundle the user
 # downloads is identical to the one the app would build for itself. The daemon
 # (not the GUI) opens CoreBluetooth, but it runs from its own helper bundle the

@@ -44,10 +44,30 @@ pub fn run(matcher: &str, install_service: bool) -> Result<()> {
         }
     }
 
-    let settings_path = claude_settings_path()?;
-    wire_hooks(&settings_path, &hook_target, matcher)?;
-    println!("✓ wired hooks into {}", settings_path.display());
-    println!("  gate + telemetry matcher: {matcher}");
+    // Wire the *active* agent's hooks — not always Claude's. A CLI user who
+    // switched to a non-Claude harness (so its hooks live in e.g.
+    // ~/.codex/hooks.json and active_agent != claude-code) and re-runs the
+    // installer to update must keep that harness as the only wired one, instead
+    // of getting stale Claude hooks re-added alongside it. Mirrors
+    // `ensure_active_agent_hooks` and `switch_agent`.
+    let cfg = crate::state::Config::load().unwrap_or_default();
+    if cfg.active_agent == crate::agent::DEFAULT_AGENT {
+        let settings_path = claude_settings_path()?;
+        wire_hooks(&settings_path, &hook_target, matcher)?;
+        println!("✓ wired hooks into {}", settings_path.display());
+        println!("  gate + telemetry matcher: {matcher}");
+    } else if let Some(profile) = crate::agent::load_profiles().get(&cfg.active_agent) {
+        install_profile(profile, &hook_target)?;
+        let target = resolve_target(&profile.install.target_path)?;
+        println!("✓ wired {} hooks into {}", profile.id, target.display());
+    } else {
+        // Active agent has no known profile; fall back to wiring Claude so the
+        // install still produces a working default.
+        let settings_path = claude_settings_path()?;
+        wire_hooks(&settings_path, &hook_target, matcher)?;
+        println!("✓ wired hooks into {}", settings_path.display());
+        println!("  gate + telemetry matcher: {matcher}");
+    }
 
     if install_service {
         match service_install_and_start(&hook_target) {
@@ -141,12 +161,17 @@ fn wire_hooks(path: &PathBuf, exe: &str, matcher: &str) -> Result<bool> {
             Some(m) => json!({ "matcher": m, "hooks": [ { "type": "command", "command": cmd } ] }),
             None => json!({ "hooks": [ { "type": "command", "command": cmd } ] }),
         };
-        hooks
-            .entry(event.to_string())
-            .or_insert_with(|| json!([]))
-            .as_array_mut()
-            .expect("event hook list is an array")
-            .push(entry);
+        // Don't `.expect()` an array here: a user's pre-existing settings.json
+        // may have one of our event keys set to a non-array value (an older
+        // schema, a hand-edit, another tool's format). Step 1 leaves such a
+        // value untouched, so overwrite it with a fresh array rather than
+        // panicking — this runs on every daemon startup, so a panic here would
+        // be a launchd crash-loop. Mirrors `set_event`'s fallback.
+        let slot = hooks.entry(event.to_string()).or_insert_with(|| json!([]));
+        match slot.as_array_mut() {
+            Some(a) => a.push(entry),
+            None => *slot = json!([entry]),
+        }
     }
 
     // 3) Drop any event array we emptied out in step 1 (keeps the file tidy and
@@ -161,8 +186,7 @@ fn wire_hooks(path: &PathBuf, exe: &str, matcher: &str) -> Result<bool> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    std::fs::write(path, serde_json::to_vec_pretty(&root)?)
-        .with_context(|| format!("writing {}", path.display()))?;
+    write_atomic(path, &serde_json::to_vec_pretty(&root)?)?;
     Ok(true)
 }
 
@@ -193,6 +217,1091 @@ fn is_ours(entry: &Value, _exe: &str) -> bool {
 /// contain characters those shells treat specially inside double quotes.
 fn shell_quote(s: &str) -> String {
     format!("\"{s}\"")
+}
+
+/// Replace any existing agent-buddy entry for `event` with `entry`, leaving the
+/// user's other hooks for that event intact. Used by the per-profile writers
+/// (the Claude path uses `wire_hooks`' bulk reconcile instead).
+fn set_event(hooks: &mut serde_json::Map<String, Value>, event: &str, entry: Value, exe: &str) {
+    let arr = hooks.entry(event.to_string()).or_insert_with(|| json!([]));
+    let Some(arr) = arr.as_array_mut() else {
+        *arr = json!([entry]);
+        return;
+    };
+    arr.retain(|e| !is_ours(e, exe));
+    arr.push(entry);
+}
+
+/// Write `bytes` to `path` atomically: stage a sibling temp file then rename it
+/// over the target. A crash mid-write can't truncate the user's config, a
+/// concurrent reader never sees a half-written file, and renaming onto the path
+/// replaces a symlink rather than writing *through* it — important because these
+/// are the very configs (`settings.json`, `config.toml`, …) the tool promises to
+/// edit safely. Callers create the parent dir; the rename is atomic on the same
+/// filesystem (the temp file is a sibling, so it always is).
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("cannot write to {} (no file name)", path.display()))?;
+    let mut tmp_name = name.to_os_string();
+    tmp_name.push(".agent-buddy.tmp");
+    let tmp = path.with_file_name(tmp_name);
+    std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Per-harness hook install/uninstall (multi-agent).
+//
+// Each agent profile carries an `InstallRecipe` (config format + target path +
+// the events to register). We install ONLY the active agent's hooks; switching
+// agents uninstalls the old harness's and installs the new one's. Every writer
+// is idempotent and reversible via the same `is_ours` filter used for Claude.
+// ---------------------------------------------------------------------------
+
+use crate::agent::{AgentProfile, ConfigFormat};
+
+/// Resolve a profile's hook-config target to an absolute path. Relative to the
+/// user's home, or to our own config dir for plugin manifests we own.
+fn resolve_target(t: &crate::agent::TargetPath) -> Result<PathBuf> {
+    if t.from_config_dir {
+        return Ok(crate::state::config_dir()?.join(&t.home_rel));
+    }
+    // An opt-in env override (e.g. COPILOT_HOME) replaces $HOME + the leading
+    // config segment of home_rel: `.copilot/hooks/hooks.json` under
+    // `<COPILOT_HOME>` becomes `<COPILOT_HOME>/hooks/hooks.json`.
+    if let Some(var) = t.home_env.as_deref() {
+        if let Ok(val) = std::env::var(var) {
+            let val = val.trim();
+            if !val.is_empty() {
+                let tail = t
+                    .home_rel
+                    .split_once('/')
+                    .map(|(_, rest)| rest)
+                    .unwrap_or(&t.home_rel);
+                return Ok(PathBuf::from(val).join(tail));
+            }
+        }
+    }
+    let base = directories::BaseDirs::new().context("could not find home directory")?;
+    Ok(base.home_dir().join(&t.home_rel))
+}
+
+/// The shell command a hook entry runs: `"<exe>" hook <EVENT> --agent <id>`.
+/// The `--agent` flag tells the daemon which profile maps this harness's event.
+fn hook_command(exe: &str, event: &str, agent_id: &str) -> String {
+    format!("{} hook {event} --agent {agent_id}", shell_quote(exe))
+}
+
+/// True if a harness event should carry the per-tool matcher (tool-gated events
+/// and the explicit permission gate). Others register matcher-less.
+fn event_is_gated(event: &str) -> bool {
+    let e = event.to_ascii_lowercase();
+    e.contains("tooluse") || e.contains("tool") && (e.contains("pre") || e.contains("post"))
+        || e == "permissionrequest"
+}
+
+/// Install the hooks for `profile` so its harness talks to our daemon. Dispatch
+/// on the config format; the JSON-settings family share one writer.
+pub fn install_profile(profile: &AgentProfile, exe: &str) -> Result<()> {
+    use ConfigFormat::*;
+    match profile.install.config_format {
+        ClaudeCodeCompatible | GeminiSettingsJson
+        | QwenSettingsJson | UserGlobalHooksJson => {
+            write_hooks_json(profile, exe)
+        }
+        // Antigravity reads a nested `clawd` group, not a top-level `hooks` map.
+        AntigravityHooksJson => write_antigravity_hooks_json(profile, exe),
+        // Kiro agent files need a top-level `name` and flat `{command}` entries.
+        KiroAgentJson => write_kiro_agent_json(profile, exe),
+        // Codex ignores ~/.codex/hooks.json entirely unless `[features].hooks =
+        // true` is set in ~/.codex/config.toml. Write the hooks the usual way,
+        // then enable the flag (best-effort: Codex still animates via the JSONL
+        // log-poll fallback if this can't be written).
+        CodexHooksJson => {
+            write_hooks_json(profile, exe)?;
+            if let Err(e) = enable_codex_hooks_feature() {
+                tracing::warn!("could not enable Codex [features].hooks: {e}");
+            }
+            Ok(())
+        }
+        // Cursor uses a different on-disk schema (flat `{ "command": … }` entries
+        // + a numeric top-level `version`) that it reads directly; the generic
+        // nested Claude shape is silently ignored, so it needs its own writer.
+        CursorHooksJson => write_cursor_hooks_json(profile, exe),
+        KimiToml => write_kimi_toml(profile, exe),
+        // Plugin/extension harnesses (opencode, pi, openclaw, hermes) have no
+        // "run a command on each event" hook; they load a plugin INTO their own
+        // process that POSTs events to our loopback HTTP listener. We bundle a
+        // minimal plugin per harness (embedded below), drop it where the harness
+        // loads plugins from, and register/enable it. The plugin discovers the
+        // daemon's live { http_port, token } from a `bridge.json` we write beside
+        // it that names our endpoint.json.
+        OpencodePlugin => install_opencode_plugin(),
+        OpenclawPlugin => install_openclaw_plugin(),
+        PiExtension => install_pi_plugin(),
+        HermesPlugin => install_hermes_plugin(),
+        Unknown => Err(anyhow!(
+            "agent {} uses an unrecognized hook-config format",
+            profile.id
+        )),
+    }
+}
+
+/// Remove our hooks for `profile` (best-effort, idempotent). Leaves the user's
+/// own hooks intact.
+pub fn uninstall_profile(profile: &AgentProfile, exe: &str) -> Result<()> {
+    use ConfigFormat::*;
+    let path = resolve_target(&profile.install.target_path)?;
+    match profile.install.config_format {
+        ClaudeCodeCompatible | CodexHooksJson | GeminiSettingsJson
+        | QwenSettingsJson | UserGlobalHooksJson => {
+            strip_our_hooks_json(&path, exe)
+        }
+        AntigravityHooksJson => strip_antigravity_hooks_json(&path, exe),
+        KiroAgentJson => strip_kiro_agent_json(&path),
+        // Cursor's flat schema keys our entries off the element's own `command`
+        // field, not the nested `hooks[].command` shape `is_ours` looks for.
+        CursorHooksJson => strip_cursor_hooks_json(&path),
+        KimiToml => strip_kimi_toml(&path),
+        OpencodePlugin => uninstall_opencode_plugin(),
+        OpenclawPlugin => uninstall_openclaw_plugin(),
+        PiExtension => uninstall_pi_plugin(),
+        HermesPlugin => uninstall_hermes_plugin(),
+        Unknown => Ok(()),
+    }
+}
+
+/// Write a `{ "hooks": { "<Event>": [ { type:command, command } ] } }` config
+/// for the JSON-settings family. Reuses the Claude `set_event`/`is_ours`
+/// idempotency, so re-running replaces our entries and leaves the user's alone.
+fn write_hooks_json(profile: &AgentProfile, exe: &str) -> Result<()> {
+    let path = resolve_target(&profile.install.target_path)?;
+    write_hooks_json_at(&path, profile, exe)
+}
+
+fn write_hooks_json_at(path: &PathBuf, profile: &AgentProfile, exe: &str) -> Result<()> {
+    let mut root: Value = match std::fs::read(path) {
+        Ok(b) if !b.is_empty() => serde_json::from_slice(&b)
+            .with_context(|| format!("parsing existing {}", path.display()))?,
+        _ => json!({}),
+    };
+    if !root.is_object() {
+        return Err(anyhow!("{} is not a JSON object", path.display()));
+    }
+    let is_qwen = matches!(profile.install.config_format, ConfigFormat::QwenSettingsJson);
+    let is_copilot = matches!(profile.install.config_format, ConfigFormat::UserGlobalHooksJson);
+    {
+        let obj = root.as_object_mut().unwrap();
+        // Copilot CLI requires a numeric top-level `version`.
+        if is_copilot && !obj.get("version").map(|v| v.is_number()).unwrap_or(false) {
+            obj.insert("version".to_string(), json!(1));
+        }
+    }
+    let hooks = root
+        .as_object_mut()
+        .unwrap()
+        .entry("hooks")
+        .or_insert_with(|| json!({}));
+    let hooks = hooks
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("`hooks` in {} is not an object", path.display()))?;
+
+    let matcher = profile.install.matcher.as_deref();
+    let mut events: Vec<String> = profile.install.events.clone();
+    // Claude-compatible harnesses also get the explicit permission gate.
+    if matches!(profile.install.config_format, ConfigFormat::ClaudeCodeCompatible)
+        && profile.capabilities.permission_approval
+        && !events.iter().any(|e| e == "PermissionRequest")
+    {
+        events.push("PermissionRequest".to_string());
+    }
+
+    for ev in &events {
+        let cmd = hook_command(exe, ev, &profile.id);
+        // Qwen registers matcher:"*" on every event except UserPromptSubmit/Stop
+        // (its MATCHERLESS set) — not just tool/permission events.
+        let want_matcher = if is_qwen {
+            !matches!(ev.as_str(), "UserPromptSubmit" | "Stop")
+        } else {
+            event_is_gated(ev)
+        };
+        let eff_matcher = if is_qwen {
+            Some("*")
+        } else {
+            matcher
+        };
+        // Qwen needs a per-event timeout so its blocking permission hook isn't
+        // killed before the user decides (600s) and other events get a sane bound.
+        let mut cmd_obj = json!({ "type": "command", "command": cmd });
+        if is_qwen {
+            let timeout = if ev == "PermissionRequest" { 600000 } else { 30000 };
+            cmd_obj
+                .as_object_mut()
+                .unwrap()
+                .insert("timeout".to_string(), json!(timeout));
+        }
+        let entry = if let (true, Some(m)) = (want_matcher, eff_matcher) {
+            json!({ "matcher": m, "hooks": [ cmd_obj ] })
+        } else {
+            json!({ "hooks": [ cmd_obj ] })
+        };
+        set_event(hooks, ev, entry, exe);
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    write_atomic(path, &serde_json::to_vec_pretty(&root)?)?;
+    Ok(())
+}
+
+/// Strip our hook entries from a JSON-settings file, leaving the user's. A
+/// missing/empty/garbage file is a no-op (nothing of ours to remove).
+fn strip_our_hooks_json(path: &PathBuf, exe: &str) -> Result<()> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) if !b.is_empty() => b,
+        _ => return Ok(()),
+    };
+    let mut root: Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+    let Some(hooks) = root
+        .as_object_mut()
+        .and_then(|o| o.get_mut("hooks"))
+        .and_then(|h| h.as_object_mut())
+    else {
+        return Ok(());
+    };
+    let before = serde_json::to_string(&hooks).unwrap_or_default();
+    for (_event, arr) in hooks.iter_mut() {
+        if let Some(arr) = arr.as_array_mut() {
+            arr.retain(|e| !is_ours(e, exe));
+        }
+    }
+    // Drop now-empty event arrays so a removed event leaves no orphan key.
+    hooks.retain(|_, v| v.as_array().map(|a| !a.is_empty()).unwrap_or(true));
+    // No-op when nothing of ours was present, so a blanket uninstall doesn't
+    // reformat / churn the mtime of an unrelated harness's settings file.
+    if serde_json::to_string(&hooks).unwrap_or_default() == before {
+        return Ok(());
+    }
+    write_atomic(path, &serde_json::to_vec_pretty(&root)?)?;
+    Ok(())
+}
+
+/// Write Cursor's hooks.json. Cursor's schema differs from Claude's: it requires
+/// a numeric top-level `version` and reads each event entry's `command` field
+/// DIRECTLY off the array element — `{ "version": 1, "hooks": { "<event>":
+/// [ { "command": "<cmd>" } ] } }`. The generic nested `{ hooks: [ { type,
+/// command } ] }` shape is silently ignored by Cursor, so route Cursor here.
+/// Idempotent: strips any prior entry whose flat `command` is ours before
+/// re-adding, leaving the user's own hooks intact.
+fn write_cursor_hooks_json(profile: &AgentProfile, exe: &str) -> Result<()> {
+    let path = resolve_target(&profile.install.target_path)?;
+    let mut root: Value = match std::fs::read(&path) {
+        Ok(b) if !b.is_empty() => serde_json::from_slice(&b)
+            .with_context(|| format!("parsing existing {}", path.display()))?,
+        _ => json!({}),
+    };
+    if !root.is_object() {
+        return Err(anyhow!("{} is not a JSON object", path.display()));
+    }
+    {
+        let obj = root.as_object_mut().unwrap();
+        // Cursor requires a numeric version; set it if missing/non-numeric.
+        if !obj.get("version").map(|v| v.is_number()).unwrap_or(false) {
+            obj.insert("version".to_string(), json!(1));
+        }
+        let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
+        let hooks = hooks
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("`hooks` in {} is not an object", path.display()))?;
+        for ev in &profile.install.events {
+            let cmd = hook_command(exe, ev, &profile.id);
+            let arr = hooks.entry(ev.to_string()).or_insert_with(|| json!([]));
+            let Some(arr) = arr.as_array_mut() else {
+                *arr = json!([{ "command": cmd }]);
+                continue;
+            };
+            arr.retain(|e| !is_ours_cursor(e));
+            arr.push(json!({ "command": cmd }));
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    write_atomic(&path, &serde_json::to_vec_pretty(&root)?)?;
+    Ok(())
+}
+
+/// True if a Cursor hooks.json array element is one of ours: a flat
+/// `{ "command": "…agent-buddy … hook …" }` entry.
+fn is_ours_cursor(entry: &Value) -> bool {
+    entry
+        .get("command")
+        .and_then(|v| v.as_str())
+        .map(|s| s.contains("agent-buddy") && s.contains(" hook "))
+        .unwrap_or(false)
+}
+
+/// Strip our flat Cursor entries, leaving the user's. Missing/empty/garbage is a
+/// no-op.
+fn strip_cursor_hooks_json(path: &PathBuf) -> Result<()> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) if !b.is_empty() => b,
+        _ => return Ok(()),
+    };
+    let mut root: Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+    let Some(hooks) = root
+        .as_object_mut()
+        .and_then(|o| o.get_mut("hooks"))
+        .and_then(|h| h.as_object_mut())
+    else {
+        return Ok(());
+    };
+    let before = serde_json::to_string(&hooks).unwrap_or_default();
+    for (_event, arr) in hooks.iter_mut() {
+        if let Some(arr) = arr.as_array_mut() {
+            arr.retain(|e| !is_ours_cursor(e));
+        }
+    }
+    if serde_json::to_string(&hooks).unwrap_or_default() == before {
+        return Ok(());
+    }
+    write_atomic(path, &serde_json::to_vec_pretty(&root)?)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Antigravity — a nested `clawd` group, NOT a top-level `hooks` map. Only
+// PostToolUse uses the `{matcher,hooks}` wrapper; the rest are flat handler
+// arrays. `timeout` is in seconds.
+// ---------------------------------------------------------------------------
+
+/// The Antigravity hook group key. Antigravity reads handlers from this group,
+/// not from a top-level `hooks` object.
+const ANTIGRAVITY_GROUP: &str = "clawd";
+
+fn write_antigravity_hooks_json(profile: &AgentProfile, exe: &str) -> Result<()> {
+    let path = resolve_target(&profile.install.target_path)?;
+    write_antigravity_hooks_at(&path, profile, exe)
+}
+
+fn write_antigravity_hooks_at(path: &PathBuf, profile: &AgentProfile, exe: &str) -> Result<()> {
+    let mut root: Value = match std::fs::read(path) {
+        Ok(b) if !b.is_empty() => serde_json::from_slice(&b)
+            .with_context(|| format!("parsing existing {}", path.display()))?,
+        _ => json!({}),
+    };
+    if !root.is_object() {
+        return Err(anyhow!("{} is not a JSON object", path.display()));
+    }
+    {
+        let obj = root.as_object_mut().unwrap();
+        let group = obj
+            .entry(ANTIGRAVITY_GROUP.to_string())
+            .or_insert_with(|| json!({}));
+        let group = group
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("`{ANTIGRAVITY_GROUP}` in {} is not an object", path.display()))?;
+        for ev in &profile.install.events {
+            let cmd = hook_command(exe, ev, &profile.id);
+            // PostToolUse wraps in {matcher,hooks}; the rest are flat handlers.
+            let entry = if ev == "PostToolUse" {
+                json!({ "matcher": "*", "hooks": [ { "type": "command", "command": cmd, "timeout": 10 } ] })
+            } else {
+                json!({ "type": "command", "command": cmd, "timeout": 10 })
+            };
+            let arr = group.entry(ev.to_string()).or_insert_with(|| json!([]));
+            let Some(arr) = arr.as_array_mut() else {
+                *arr = json!([entry]);
+                continue;
+            };
+            arr.retain(|e| !is_ours_antigravity(e));
+            arr.push(entry);
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    write_atomic(path, &serde_json::to_vec_pretty(&root)?)?;
+    Ok(())
+}
+
+/// True if an Antigravity group entry is one of ours — either a flat
+/// `{type:command,command}` handler or a `{matcher,hooks:[…]}` wrapper whose
+/// inner command runs `agent-buddy … hook …`.
+fn is_ours_antigravity(entry: &Value) -> bool {
+    let cmd_is_ours = |c: &Value| {
+        c.get("command")
+            .and_then(|v| v.as_str())
+            .map(|s| s.contains("agent-buddy") && s.contains(" hook "))
+            .unwrap_or(false)
+    };
+    if cmd_is_ours(entry) {
+        return true;
+    }
+    entry
+        .get("hooks")
+        .and_then(|h| h.as_array())
+        .map(|cmds| cmds.iter().any(cmd_is_ours))
+        .unwrap_or(false)
+}
+
+/// Strip only buddy-owned entries from the `clawd` group, deleting the group if
+/// it becomes empty. Leaves a coexisting clawd-on-desk install intact.
+fn strip_antigravity_hooks_json(path: &PathBuf, _exe: &str) -> Result<()> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) if !b.is_empty() => b,
+        _ => return Ok(()),
+    };
+    let mut root: Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+    let Some(group) = root
+        .as_object_mut()
+        .and_then(|o| o.get_mut(ANTIGRAVITY_GROUP))
+        .and_then(|g| g.as_object_mut())
+    else {
+        return Ok(());
+    };
+    let before = serde_json::to_string(&group).unwrap_or_default();
+    for (_event, arr) in group.iter_mut() {
+        if let Some(arr) = arr.as_array_mut() {
+            arr.retain(|e| !is_ours_antigravity(e));
+        }
+    }
+    group.retain(|_, v| v.as_array().map(|a| !a.is_empty()).unwrap_or(true));
+    let after = serde_json::to_string(&group).unwrap_or_default();
+    if after == before {
+        return Ok(());
+    }
+    // Drop the whole group if it's now empty.
+    if group.is_empty() {
+        root.as_object_mut().unwrap().remove(ANTIGRAVITY_GROUP);
+    }
+    write_atomic(path, &serde_json::to_vec_pretty(&root)?)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Kiro — an agent-descriptor file requiring a top-level `name` and flat
+// `{ "command": … }` entries under `hooks[<event>]` (not the nested Claude shape).
+// ---------------------------------------------------------------------------
+
+fn write_kiro_agent_json(profile: &AgentProfile, exe: &str) -> Result<()> {
+    let path = resolve_target(&profile.install.target_path)?;
+    write_kiro_agent_at(&path, profile, exe)
+}
+
+fn write_kiro_agent_at(path: &PathBuf, profile: &AgentProfile, exe: &str) -> Result<()> {
+    let mut root: Value = match std::fs::read(path) {
+        Ok(b) if !b.is_empty() => serde_json::from_slice(&b)
+            .with_context(|| format!("parsing existing {}", path.display()))?,
+        _ => json!({}),
+    };
+    if !root.is_object() {
+        return Err(anyhow!("{} is not a JSON object", path.display()));
+    }
+    {
+        let obj = root.as_object_mut().unwrap();
+        // Kiro requires a top-level `name`; default to the file stem ("buddy"),
+        // preserving any existing name. Seed a description only on creation.
+        let created = !obj.contains_key("name");
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&profile.id)
+            .to_string();
+        obj.entry("name".to_string()).or_insert_with(|| json!(stem));
+        if created {
+            obj.entry("description".to_string())
+                .or_insert_with(|| json!("buddy agent with desktop pet hooks"));
+        }
+        let hooks = obj.entry("hooks".to_string()).or_insert_with(|| json!({}));
+        let hooks = hooks
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("`hooks` in {} is not an object", path.display()))?;
+        for ev in &profile.install.events {
+            let cmd = hook_command(exe, ev, &profile.id);
+            let arr = hooks.entry(ev.to_string()).or_insert_with(|| json!([]));
+            let Some(arr) = arr.as_array_mut() else {
+                *arr = json!([{ "command": cmd }]);
+                continue;
+            };
+            arr.retain(|e| !is_ours_cursor(e)); // flat `command` dedupe
+            arr.push(json!({ "command": cmd }));
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    write_atomic(path, &serde_json::to_vec_pretty(&root)?)?;
+    Ok(())
+}
+
+/// Strip our flat Kiro hook entries, preserving `name`/`description` and the
+/// user's own hooks. A missing/empty/garbage file is a no-op.
+fn strip_kiro_agent_json(path: &PathBuf) -> Result<()> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) if !b.is_empty() => b,
+        _ => return Ok(()),
+    };
+    let mut root: Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+    let Some(hooks) = root
+        .as_object_mut()
+        .and_then(|o| o.get_mut("hooks"))
+        .and_then(|h| h.as_object_mut())
+    else {
+        return Ok(());
+    };
+    let before = serde_json::to_string(&hooks).unwrap_or_default();
+    for (_event, arr) in hooks.iter_mut() {
+        if let Some(arr) = arr.as_array_mut() {
+            arr.retain(|e| !is_ours_cursor(e));
+        }
+    }
+    hooks.retain(|_, v| v.as_array().map(|a| !a.is_empty()).unwrap_or(true));
+    if serde_json::to_string(&hooks).unwrap_or_default() == before {
+        return Ok(());
+    }
+    write_atomic(path, &serde_json::to_vec_pretty(&root)?)?;
+    Ok(())
+}
+
+/// Codex only honors its `hooks.json` when `[features].hooks = true` is present
+/// in `~/.codex/config.toml`. Set that flag without disturbing the rest of the
+/// user's Codex config. Idempotent: a no-op when already enabled. Best-effort —
+/// the caller logs (doesn't fail) on error, since Codex still animates via the
+/// JSONL log-poll fallback.
+fn enable_codex_hooks_feature() -> Result<()> {
+    let base = directories::BaseDirs::new().context("could not find home directory")?;
+    let path = base.home_dir().join(".codex").join("config.toml");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let updated = set_features_hooks_true(&existing);
+    if updated == existing {
+        return Ok(()); // already enabled — don't churn the file
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    write_atomic(&path, updated.as_bytes())?;
+    Ok(())
+}
+
+/// Pure transform: return `toml` with `[features].hooks = true` ensured. Edits an
+/// existing `[features]` table in place (replacing its `hooks = …` line, or
+/// inserting one right after the header); otherwise appends a fresh `[features]`
+/// table. Conservative — only ever touches the `[features]` section, so the rest
+/// of the user's Codex config is preserved byte-for-byte.
+fn set_features_hooks_true(toml: &str) -> String {
+    let lines: Vec<&str> = toml.lines().collect();
+    let is_features_header = |l: &str| l.trim() == "[features]";
+    if let Some(hdr) = lines.iter().position(|l| is_features_header(l)) {
+        // The section runs until the next table header (a line starting with `[`).
+        let end = (hdr + 1..lines.len())
+            .find(|&i| lines[i].trim_start().starts_with('['))
+            .unwrap_or(lines.len());
+        // An existing `hooks` key in this section (exact key before `=`).
+        let hooks_idx = (hdr + 1..end)
+            .find(|&i| lines[i].split('=').next().map(str::trim) == Some("hooks"));
+        let mut out: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+        match hooks_idx {
+            Some(i) => out[i] = "hooks = true".to_string(),
+            None => out.insert(hdr + 1, "hooks = true".to_string()),
+        }
+        let mut joined = out.join("\n");
+        if toml.ends_with('\n') && !joined.ends_with('\n') {
+            joined.push('\n');
+        }
+        joined
+    } else {
+        let mut out = toml.to_string();
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        if !out.is_empty() {
+            out.push('\n'); // blank line before the appended table
+        }
+        out.push_str("[features]\nhooks = true\n");
+        out
+    }
+}
+
+/// Marker our hook lines carry in the Kimi TOML so we can find + strip them.
+const TOML_MARK: &str = "# agent-buddy hook (managed — do not edit)";
+
+/// Write Kimi's TOML hook block. We append a clearly-marked managed section and
+/// strip any prior one first so re-running is idempotent.
+fn write_kimi_toml(profile: &AgentProfile, exe: &str) -> Result<()> {
+    let path = resolve_target(&profile.install.target_path)?;
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut out = strip_marked_block(&existing);
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(TOML_MARK);
+    out.push('\n');
+    for ev in &profile.install.events {
+        // One [[hooks]] entry per event invoking our relay.
+        out.push_str(&format!(
+            "[[hooks]]\nevent = \"{ev}\"\ncommand = {}\n",
+            toml_quote(&hook_command(exe, ev, &profile.id))
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    write_atomic(&path, out.as_bytes())?;
+    Ok(())
+}
+
+fn strip_kimi_toml(path: &PathBuf) -> Result<()> {
+    let Ok(existing) = std::fs::read_to_string(path) else {
+        return Ok(());
+    };
+    let stripped = strip_marked_block(&existing);
+    write_atomic(path, stripped.as_bytes())?;
+    Ok(())
+}
+
+/// Remove everything from our `TOML_MARK` line to the end of the file (our block
+/// is always appended last), leaving the user's content untouched.
+fn strip_marked_block(s: &str) -> String {
+    match s.find(TOML_MARK) {
+        Some(i) => s[..i].trim_end().to_string(),
+        None => s.to_string(),
+    }
+}
+
+/// TOML basic-string quoting (escape backslash + quote). Our exe paths contain
+/// neither control chars nor backslashes on Unix, but Windows paths do.
+fn toml_quote(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+// ---------------------------------------------------------------------------
+// Plugin/extension harnesses (opencode, pi, openclaw, hermes).
+//
+// These don't spawn a hook command; they load a plugin INTO their own process
+// that POSTs lifecycle events to our daemon's loopback HTTP listener. We bundle
+// a minimal plugin per harness (embedded via include_str! so a CLI install
+// needs no external assets), write it where the harness loads plugins from, and
+// register/enable it. Beside each plugin we write a `bridge.json` naming our
+// `endpoint.json`; the plugin reads it per-event to find the daemon's live
+// { http_port, token }, so a daemon restart (new port/token) needs no re-install.
+// ---------------------------------------------------------------------------
+
+const OPENCODE_INDEX_MJS: &str = include_str!("../assets/plugins/opencode/index.mjs");
+const OPENCODE_PACKAGE_JSON: &str = include_str!("../assets/plugins/opencode/package.json");
+const OPENCLAW_INDEX_JS: &str = include_str!("../assets/plugins/openclaw/index.js");
+const OPENCLAW_MANIFEST_JSON: &str = include_str!("../assets/plugins/openclaw/openclaw.plugin.json");
+const OPENCLAW_PACKAGE_JSON: &str = include_str!("../assets/plugins/openclaw/package.json");
+const PI_INDEX_TS: &str = include_str!("../assets/plugins/pi/index.ts");
+const HERMES_INIT_PY: &str = include_str!("../assets/plugins/hermes/__init__.py");
+const HERMES_PLUGIN_YAML: &str = include_str!("../assets/plugins/hermes/plugin.yaml");
+
+/// The plugin id we register under in each harness's config (and the dir name).
+const PLUGIN_ID: &str = "agent-buddy";
+
+/// Write a `bridge.json` beside an installed plugin so it can find the daemon.
+/// It names the absolute path of our `endpoint.json` (stable across daemon
+/// restarts — only the port/token *inside* change) plus the agent id to report.
+fn write_bridge_json(dir: &std::path::Path, agent_id: &str) -> Result<()> {
+    let endpoint = crate::ipc::endpoint_path()?;
+    let manifest = json!({
+        "endpoint": endpoint.to_string_lossy(),
+        "agent": agent_id,
+    });
+    std::fs::write(dir.join("bridge.json"), serde_json::to_vec_pretty(&manifest)?)
+        .with_context(|| format!("writing {}", dir.join("bridge.json").display()))?;
+    Ok(())
+}
+
+/// Write a set of (filename, contents) into `dir`, creating it.
+fn write_plugin_files(dir: &std::path::Path, files: &[(&str, &str)]) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    for (name, contents) in files {
+        std::fs::write(dir.join(name), contents)
+            .with_context(|| format!("writing {}", dir.join(name).display()))?;
+    }
+    Ok(())
+}
+
+fn home_dir() -> Result<PathBuf> {
+    Ok(directories::BaseDirs::new()
+        .context("could not find home directory")?
+        .home_dir()
+        .to_path_buf())
+}
+
+// --- opencode: plugin dir registered by absolute path in opencode.json --------
+
+/// Where we keep the opencode/openclaw plugin payloads (our own config dir, a
+/// stable absolute path we then register inside the harness's config).
+fn our_plugin_dir(name: &str) -> Result<PathBuf> {
+    Ok(crate::state::config_dir()?.join("plugins").join(name))
+}
+
+fn install_opencode_plugin() -> Result<()> {
+    let dir = our_plugin_dir("opencode")?;
+    write_plugin_files(
+        &dir,
+        &[
+            ("index.mjs", OPENCODE_INDEX_MJS),
+            ("package.json", OPENCODE_PACKAGE_JSON),
+        ],
+    )?;
+    write_bridge_json(&dir, "opencode")?;
+    // Register the dir's absolute path in ~/.config/opencode/opencode.json's
+    // `plugin` array. opencode reads the dir's package.json `main`.
+    let cfg = home_dir()?.join(".config/opencode/opencode.json");
+    let dir_str = dir.to_string_lossy().replace('\\', "/");
+    edit_json_string_array(&cfg, &["plugin"], &dir_str, true, |o| {
+        o.entry("$schema".to_string())
+            .or_insert_with(|| json!("https://opencode.ai/config.json"));
+    })
+}
+
+fn uninstall_opencode_plugin() -> Result<()> {
+    let dir = our_plugin_dir("opencode")?;
+    let dir_str = dir.to_string_lossy().replace('\\', "/");
+    let cfg = home_dir()?.join(".config/opencode/opencode.json");
+    let _ = edit_json_string_array(&cfg, &["plugin"], &dir_str, false, |_| {});
+    if dir.exists() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    Ok(())
+}
+
+// --- openclaw: plugin dir in openclaw.json paths + entries --------------------
+
+fn install_openclaw_plugin() -> Result<()> {
+    let dir = our_plugin_dir("openclaw")?;
+    write_plugin_files(
+        &dir,
+        &[
+            ("index.js", OPENCLAW_INDEX_JS),
+            ("openclaw.plugin.json", OPENCLAW_MANIFEST_JSON),
+            ("package.json", OPENCLAW_PACKAGE_JSON),
+        ],
+    )?;
+    write_bridge_json(&dir, "openclaw")?;
+    let cfg = openclaw_config_path()?;
+    let dir_str = dir.to_string_lossy().replace('\\', "/");
+    edit_openclaw_config(&cfg, &dir_str, true)
+}
+
+fn uninstall_openclaw_plugin() -> Result<()> {
+    let dir = our_plugin_dir("openclaw")?;
+    let dir_str = dir.to_string_lossy().replace('\\', "/");
+    if let Ok(cfg) = openclaw_config_path() {
+        let _ = edit_openclaw_config(&cfg, &dir_str, false);
+    }
+    if dir.exists() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    Ok(())
+}
+
+fn openclaw_config_path() -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("OPENCLAW_CONFIG_PATH") {
+        if !p.is_empty() {
+            return Ok(PathBuf::from(p));
+        }
+    }
+    let base = std::env::var("OPENCLAW_STATE_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or(home_dir()?.join(".openclaw"));
+    Ok(base.join("openclaw.json"))
+}
+
+/// Add/remove our plugin dir in openclaw.json: `plugins.load.paths[]` plus a
+/// `plugins.entries["agent-buddy"]` enable record. Preserves the user's config.
+fn edit_openclaw_config(cfg: &std::path::Path, dir_str: &str, add: bool) -> Result<()> {
+    if !add && !cfg.exists() {
+        return Ok(());
+    }
+    let mut root: Value = match std::fs::read(cfg) {
+        Ok(b) if !b.is_empty() => serde_json::from_slice(&b)
+            .with_context(|| format!("parsing {}", cfg.display()))?,
+        _ => json!({}),
+    };
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("{} is not a JSON object", cfg.display()))?;
+    let plugins = obj
+        .entry("plugins".to_string())
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("`plugins` in {} is not an object", cfg.display()))?;
+    // paths
+    let load = plugins
+        .entry("load".to_string())
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("`plugins.load` is not an object"))?;
+    let paths = load
+        .entry("paths".to_string())
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or_else(|| anyhow!("`plugins.load.paths` is not an array"))?;
+    paths.retain(|v| v.as_str().map(|s| s.replace('\\', "/") != dir_str).unwrap_or(true));
+    if add {
+        paths.push(json!(dir_str));
+    }
+    // entries
+    let entries = plugins
+        .entry("entries".to_string())
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("`plugins.entries` is not an object"))?;
+    if add {
+        entries.insert(
+            PLUGIN_ID.to_string(),
+            json!({ "enabled": true, "hooks": { "allowConversationAccess": false } }),
+        );
+    } else {
+        entries.remove(PLUGIN_ID);
+    }
+    if let Some(parent) = cfg.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    write_atomic(cfg, &serde_json::to_vec_pretty(&root)?)?;
+    Ok(())
+}
+
+// --- pi: TS extension copied into ~/.pi/agent/extensions/agent-buddy ----------
+
+fn pi_extension_dir() -> Result<PathBuf> {
+    Ok(home_dir()?.join(".pi/agent/extensions").join(PLUGIN_ID))
+}
+
+fn install_pi_plugin() -> Result<()> {
+    let dir = pi_extension_dir()?;
+    write_plugin_files(&dir, &[("index.ts", PI_INDEX_TS)])?;
+    write_bridge_json(&dir, "pi")?;
+    std::fs::write(dir.join(".agent-buddy-managed.json"), MANAGED_MARKER)
+        .with_context(|| format!("writing {}", dir.join(".agent-buddy-managed.json").display()))?;
+    Ok(())
+}
+
+fn uninstall_pi_plugin() -> Result<()> {
+    remove_managed_dir(&pi_extension_dir()?)
+}
+
+// --- hermes: Python package copied into $HERMES_HOME/plugins/agent-buddy ------
+
+fn hermes_home() -> Result<PathBuf> {
+    if let Ok(h) = std::env::var("HERMES_HOME") {
+        if !h.is_empty() {
+            return Ok(PathBuf::from(h));
+        }
+    }
+    #[cfg(target_os = "windows")]
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        if !local.is_empty() {
+            return Ok(PathBuf::from(local).join("hermes"));
+        }
+    }
+    Ok(home_dir()?.join(".hermes"))
+}
+
+fn install_hermes_plugin() -> Result<()> {
+    let home = hermes_home()?;
+    let dir = home.join("plugins").join(PLUGIN_ID);
+    write_plugin_files(
+        &dir,
+        &[("__init__.py", HERMES_INIT_PY), ("plugin.yaml", HERMES_PLUGIN_YAML)],
+    )?;
+    write_bridge_json(&dir, "hermes")?;
+    std::fs::write(dir.join(".agent-buddy-managed.json"), MANAGED_MARKER).ok();
+    // Enable it. Hermes ships inside a venv and is rarely on PATH, so resolve the
+    // venv binary first; fall back to bare `hermes`. Enable for the root home AND
+    // each discovered profile (mirrors the reference's per-profile sync). Write
+    // the enabled list directly only as a last resort so a missing CLI doesn't
+    // leave the plugin installed-but-disabled.
+    let cli = hermes_cli_path(&home);
+    let mut enabled_any = run_hermes_enable(&cli, &home);
+    for profile_home in hermes_profile_homes(&home) {
+        if run_hermes_enable(&cli, &profile_home) {
+            enabled_any = true;
+        }
+    }
+    if !enabled_any {
+        tracing::warn!(
+            "could not enable the hermes plugin via the CLI; writing plugins.enabled \
+             directly (you may need to run `hermes plugins enable {PLUGIN_ID}` manually)"
+        );
+        ensure_line_in_file(&home.join("plugins.enabled"), PLUGIN_ID)?;
+    }
+    Ok(())
+}
+
+/// Resolve the Hermes CLI: prefer the venv binary under `<home>/hermes-agent/venv`
+/// (Unix `bin/hermes`, Windows `Scripts/hermes.exe`), else bare `hermes` on PATH.
+fn hermes_cli_path(home: &std::path::Path) -> PathBuf {
+    let venv = home.join("hermes-agent").join("venv");
+    #[cfg(target_os = "windows")]
+    let candidate = venv.join("Scripts").join("hermes.exe");
+    #[cfg(not(target_os = "windows"))]
+    let candidate = venv.join("bin").join("hermes");
+    if candidate.exists() {
+        candidate
+    } else {
+        PathBuf::from("hermes")
+    }
+}
+
+/// Profile home dirs that carry a `config.yaml` under `<home>/profiles/*/`.
+fn hermes_profile_homes(home: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(home.join("profiles")) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.join("config.yaml").exists() {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// Run `<cli> plugins enable <PLUGIN_ID>` with `HERMES_HOME` set; true on success.
+fn run_hermes_enable(cli: &std::path::Path, hermes_home: &std::path::Path) -> bool {
+    std::process::Command::new(cli)
+        .args(["plugins", "enable", PLUGIN_ID])
+        .env("HERMES_HOME", hermes_home)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn uninstall_hermes_plugin() -> Result<()> {
+    let home = hermes_home()?;
+    let _ = std::process::Command::new("hermes")
+        .args(["plugins", "disable", PLUGIN_ID])
+        .env("HERMES_HOME", &home)
+        .output();
+    let enabled = home.join("plugins.enabled");
+    if enabled.exists() {
+        let _ = remove_line_from_file(&enabled, PLUGIN_ID);
+    }
+    remove_managed_dir(&home.join("plugins").join(PLUGIN_ID))
+}
+
+// --- shared helpers -----------------------------------------------------------
+
+/// Marker file content proving a plugin dir is ours (so uninstall only deletes
+/// dirs we created, never a user's own same-named extension).
+const MANAGED_MARKER: &str = "{ \"app\": \"agent-buddy\", \"managed\": true }\n";
+
+/// Remove a plugin dir only if it carries our managed marker (best-effort).
+fn remove_managed_dir(dir: &std::path::Path) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    if dir.join(".agent-buddy-managed.json").exists() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    Ok(())
+}
+
+/// Ensure `line` is present in `path` (one entry per line), creating the file if
+/// needed. Idempotent.
+fn ensure_line_in_file(path: &std::path::Path, line: &str) -> Result<()> {
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    if existing.lines().any(|l| l.trim() == line) {
+        return Ok(());
+    }
+    let mut out = existing;
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(line);
+    out.push('\n');
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    write_atomic(path, out.as_bytes())?;
+    Ok(())
+}
+
+/// Remove every occurrence of `line` from `path` (one entry per line).
+fn remove_line_from_file(path: &std::path::Path, line: &str) -> Result<()> {
+    let Ok(existing) = std::fs::read_to_string(path) else {
+        return Ok(());
+    };
+    let kept: Vec<&str> = existing.lines().filter(|l| l.trim() != line).collect();
+    let mut out = kept.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    write_atomic(path, out.as_bytes())?;
+    Ok(())
+}
+
+/// Add or remove `value` in a nested JSON string array at `keys` (e.g.
+/// `["plugin"]`), preserving the rest of the file. `seed` runs on the root
+/// object before editing (e.g. to add a `$schema`). Idempotent. A remove on a
+/// missing file is a no-op.
+fn edit_json_string_array(
+    path: &std::path::Path,
+    keys: &[&str],
+    value: &str,
+    add: bool,
+    seed: impl FnOnce(&mut serde_json::Map<String, Value>),
+) -> Result<()> {
+    if !add && !path.exists() {
+        return Ok(());
+    }
+    let mut root: Value = match std::fs::read(path) {
+        Ok(b) if !b.is_empty() => serde_json::from_slice(&b)
+            .with_context(|| format!("parsing {}", path.display()))?,
+        _ => json!({}),
+    };
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("{} is not a JSON object", path.display()))?;
+    if add {
+        seed(obj);
+    }
+    // Walk/create down to the array's parent.
+    let (last, parents) = keys.split_last().expect("at least one key");
+    let mut cur = obj;
+    for k in parents {
+        cur = cur
+            .entry(k.to_string())
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("`{k}` in {} is not an object", path.display()))?;
+    }
+    let arr = cur
+        .entry(last.to_string())
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or_else(|| anyhow!("`{last}` in {} is not an array", path.display()))?;
+    arr.retain(|v| v.as_str().map(|s| s.replace('\\', "/") != value).unwrap_or(true));
+    if add {
+        arr.push(json!(value));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    write_atomic(path, &serde_json::to_vec_pretty(&root)?)?;
+    Ok(())
 }
 
 fn claude_settings_path() -> Result<PathBuf> {
@@ -247,6 +1356,34 @@ pub fn ensure_claude_hooks() -> Result<bool> {
     wire_hooks(&settings_path, &target.to_string_lossy(), &configured_matcher())
 }
 
+/// Reconcile the *active* agent's hooks against the installed daemon. For the
+/// default Claude Code agent this is exactly [`ensure_claude_hooks`] (the
+/// matcher-aware, self-healing path the GUI/CLI/install share). For any other
+/// harness it re-applies that profile's [`InstallRecipe`] against the installed
+/// daemon binary, so a daemon restart repairs a non-Claude harness's hooks too
+/// (stale binary path after an app update, a hook the user deleted, a changed
+/// event set). Best-effort; only acts when a real installed daemon exists so a
+/// dev `cargo run` never rewrites the user's harness config. Returns whether
+/// work was applied.
+pub fn ensure_active_agent_hooks(
+    config: &crate::state::Config,
+    profiles: &std::collections::HashMap<String, AgentProfile>,
+) -> Result<bool> {
+    // The default agent uses the dedicated, matcher-aware Claude reconcile.
+    if config.active_agent == crate::agent::DEFAULT_AGENT {
+        return ensure_claude_hooks();
+    }
+    let target = installed_daemon_path()?;
+    if !target.exists() {
+        return Ok(false);
+    }
+    let Some(profile) = profiles.get(&config.active_agent) else {
+        return Ok(false);
+    };
+    install_profile(profile, &target.to_string_lossy())?;
+    Ok(true)
+}
+
 /// Remove every agent-buddy hook entry from Claude Code's settings, leaving the
 /// user's own hooks in place. Used by `uninstall`. A missing, empty, or
 /// unparseable settings file is a no-op. Returns whether anything changed.
@@ -280,8 +1417,7 @@ fn strip_hooks_at(path: &PathBuf) -> Result<bool> {
     if serde_json::to_string(hooks).unwrap_or_default() == before {
         return Ok(false);
     }
-    std::fs::write(&path, serde_json::to_vec_pretty(&root)?)
-        .with_context(|| format!("writing {}", path.display()))?;
+    write_atomic(&path, &serde_json::to_vec_pretty(&root)?)?;
     Ok(true)
 }
 
@@ -308,6 +1444,11 @@ fn install_daemon_service(exe: &str) -> Result<String> {
     // crash loop — so that change must land together with the daemon's exit-code
     // fix, not before it. (ProgramArguments points at the codesigned helper
     // bundle so the daemon's Bluetooth TCC grant keys to a stable identity.)
+    // XML-escape the interpolated paths (parity with the Windows task path): a
+    // home dir / username containing `&`, `<`, or `"` would otherwise produce a
+    // malformed plist that launchd rejects.
+    let exe = xml_escape(exe);
+    let log = xml_escape(&log);
     let body = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -354,9 +1495,12 @@ fn install_daemon_service(exe: &str) -> Result<String> {
     let dir = base.home_dir().join(".config/systemd/user");
     std::fs::create_dir_all(&dir)?;
     let unit = dir.join("agent-buddy.service");
+    // RestartSec throttles the respawn so a daemon that fails fast at startup
+    // (e.g. BlueZ not yet up) doesn't tight-loop into systemd's StartLimit and
+    // then stay dead.
     let body = format!(
         "[Unit]\nDescription=Claude buddy bridge daemon\n\n\
-         [Service]\nExecStart={exe} daemon\nRestart=always\n\n\
+         [Service]\nExecStart={exe} daemon\nRestart=always\nRestartSec=2\n\n\
          [Install]\nWantedBy=default.target\n"
     );
     std::fs::write(&unit, body)?;
@@ -435,8 +1579,9 @@ fn install_daemon_service(exe: &str) -> Result<String> {
     ))
 }
 
-/// Minimal XML text escaping for the exe path embedded in the task definition.
-#[cfg(target_os = "windows")]
+/// Minimal XML text escaping for a path embedded in a task/plist definition.
+/// Used by both the Windows Scheduled Task XML and the macOS LaunchAgent plist.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -1013,13 +2158,27 @@ pub fn install_app_login_item(app_exe: &str) -> Result<String> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn install_app_login_item(_app_exe: &str) -> Result<String> {
-    // The GUI/tray needs a graphical session; autostart belongs to the desktop
-    // environment (an XDG `~/.config/autostart/*.desktop` entry), not a systemd
-    // user unit, and varies by DE — left to the user for now.
-    Err(anyhow!(
-        "open-at-login isn’t wired for Linux yet — add an XDG autostart .desktop entry"
-    ))
+pub fn install_app_login_item(app_exe: &str) -> Result<String> {
+    // The GUI/tray needs a graphical session, so autostart goes through the
+    // freedesktop XDG spec (`~/.config/autostart/*.desktop`) honored by GNOME,
+    // KDE, XFCE, and the other major DEs — the cross-DE equivalent of the macOS
+    // LaunchAgent / Windows logon task. `OnlyShowIn` is omitted so every DE runs
+    // it. `Exec` must be an absolute path; the installed app exe is.
+    let base = directories::BaseDirs::new().context("home dir")?;
+    let dir = base.home_dir().join(".config/autostart");
+    std::fs::create_dir_all(&dir)?;
+    let entry = dir.join("agent-buddy-app.desktop");
+    // Escape `Exec`: a `%` is a field code in the .desktop spec (literal `%` is
+    // `%%`); paths with spaces are fine unquoted for a single-arg Exec, but quote
+    // for safety and double any embedded quote.
+    let exec = app_exe.replace('%', "%%");
+    let body = format!(
+        "[Desktop Entry]\nType=Application\nName=Agent Buddy\n\
+         Comment=Hardware buddy gateway\nExec=\"{exec}\"\n\
+         Terminal=false\nX-GNOME-Autostart-enabled=true\n"
+    );
+    write_atomic(&entry, body.as_bytes())?;
+    Ok(format!("desktop app set to open at login ({})", entry.display()))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -1238,6 +2397,28 @@ pub fn uninstall() -> Result<String> {
     note("background service", remove_daemon_service());
     note("desktop app login item", remove_app_login_item());
     note("Claude Code hooks", strip_claude_hooks());
+    // Also strip every non-Claude harness's hooks. Switching the active agent
+    // writes hook entries into that harness's OWN config (~/.codex/hooks.json,
+    // ~/.gemini/settings.json, ~/.kimi/config.toml, …); without this, a user who
+    // tried a non-Claude harness then uninstalled is left with a dead
+    // `agent-buddy hook … --agent <id>` wired into their other AI tool — and once
+    // the daemon binary below is removed, that hook fails to spawn on every event.
+    // is_ours matches by the `agent-buddy`+` hook ` substring (exe-independent),
+    // so this is idempotent and a no-op for harnesses that were never wired.
+    {
+        let exe = installed_daemon_path()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        for profile in crate::agent::load_profiles().values() {
+            if profile.id == crate::agent::DEFAULT_AGENT {
+                continue; // already handled by strip_claude_hooks
+            }
+            note(
+                &format!("{} hooks", profile.id),
+                uninstall_profile(profile, &exe).map(|_| true),
+            );
+        }
+    }
     note("daemon binary", remove_daemon_binary());
     note("desktop launcher", remove_desktop_launcher());
     note("per-user state", remove_state_dir());
@@ -1325,7 +2506,15 @@ fn remove_app_login_item() -> Result<bool> {
     not(any(target_os = "macos", target_os = "linux", target_os = "windows"))
 ))]
 fn remove_app_login_item() -> Result<bool> {
-    // No login item is wired on Linux (autostart is left to the DE).
+    // Remove the XDG autostart entry written by install_app_login_item.
+    let base = directories::BaseDirs::new().context("home dir")?;
+    let entry = base
+        .home_dir()
+        .join(".config/autostart/agent-buddy-app.desktop");
+    if entry.exists() {
+        std::fs::remove_file(&entry).with_context(|| format!("removing {}", entry.display()))?;
+        return Ok(true);
+    }
     Ok(false)
 }
 
@@ -1417,6 +2606,203 @@ fn remove_desktop_launcher() -> Result<bool> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn hook_command_carries_agent_flag() {
+        let c = hook_command("/x/agent-buddy", "PreToolUse", "codex");
+        assert_eq!(c, "\"/x/agent-buddy\" hook PreToolUse --agent codex");
+        assert!(is_ours(
+            &json!({ "hooks": [ { "type": "command", "command": c } ] }),
+            ""
+        ));
+    }
+
+    #[test]
+    fn gated_events_get_the_matcher() {
+        assert!(event_is_gated("PreToolUse"));
+        assert!(event_is_gated("postToolUse"));
+        assert!(event_is_gated("PermissionRequest"));
+        assert!(!event_is_gated("SessionStart"));
+        assert!(!event_is_gated("Notification"));
+    }
+
+    #[test]
+    fn marked_block_strips_only_our_tail() {
+        let user = "[settings]\nkey = 1\n";
+        let with = format!("{user}{TOML_MARK}\n[[hooks]]\nevent = \"Stop\"\n");
+        assert_eq!(strip_marked_block(&with), "[settings]\nkey = 1");
+        // No marker → untouched.
+        assert_eq!(strip_marked_block(user), user);
+    }
+
+    #[test]
+    fn toml_quote_escapes_windows_paths() {
+        assert_eq!(toml_quote(r"C:\x\agent-buddy.exe"), r#""C:\\x\\agent-buddy.exe""#);
+    }
+
+    #[test]
+    fn opencode_plugin_array_add_remove_is_idempotent_and_preserves_config() {
+        let p = tmp("opencode");
+        let _ = std::fs::remove_file(&p);
+        std::fs::write(
+            &p,
+            r#"{"$schema":"x","plugin":["user/their-plugin"],"theme":"dark"}"#,
+        )
+        .unwrap();
+        edit_json_string_array(&p, &["plugin"], "/abs/agent-buddy", true, |_| {}).unwrap();
+        edit_json_string_array(&p, &["plugin"], "/abs/agent-buddy", true, |_| {}).unwrap();
+        let v: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        let arr = v["plugin"].as_array().unwrap();
+        assert_eq!(arr.iter().filter(|e| *e == "/abs/agent-buddy").count(), 1);
+        assert!(arr.iter().any(|e| e == "user/their-plugin"));
+        assert_eq!(v["theme"], "dark");
+        edit_json_string_array(&p, &["plugin"], "/abs/agent-buddy", false, |_| {}).unwrap();
+        let v: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        let arr = v["plugin"].as_array().unwrap();
+        assert!(!arr.iter().any(|e| e == "/abs/agent-buddy"));
+        assert!(arr.iter().any(|e| e == "user/their-plugin"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn opencode_register_seeds_schema_on_fresh_file() {
+        let p = tmp("opencode-fresh");
+        let _ = std::fs::remove_file(&p);
+        edit_json_string_array(&p, &["plugin"], "/abs/x", true, |o| {
+            o.entry("$schema".to_string())
+                .or_insert_with(|| json!("https://opencode.ai/config.json"));
+        })
+        .unwrap();
+        let v: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        assert_eq!(v["$schema"], "https://opencode.ai/config.json");
+        assert_eq!(v["plugin"][0], "/abs/x");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn openclaw_config_links_paths_and_entries_then_unlinks() {
+        let p = tmp("openclaw");
+        let _ = std::fs::remove_file(&p);
+        edit_openclaw_config(&p, "/abs/agent-buddy", true).unwrap();
+        edit_openclaw_config(&p, "/abs/agent-buddy", true).unwrap();
+        let v: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        let paths = v["plugins"]["load"]["paths"].as_array().unwrap();
+        assert_eq!(paths.iter().filter(|e| *e == "/abs/agent-buddy").count(), 1);
+        assert_eq!(v["plugins"]["entries"]["agent-buddy"]["enabled"], true);
+        edit_openclaw_config(&p, "/abs/agent-buddy", false).unwrap();
+        let v: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        assert!(!v["plugins"]["load"]["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e == "/abs/agent-buddy"));
+        assert!(v["plugins"]["entries"].get("agent-buddy").is_none());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn enabled_file_add_remove_is_idempotent() {
+        let p = tmp("enabled");
+        let _ = std::fs::remove_file(&p);
+        std::fs::write(&p, "other-plugin\n").unwrap();
+        ensure_line_in_file(&p, "agent-buddy").unwrap();
+        ensure_line_in_file(&p, "agent-buddy").unwrap();
+        let s = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(s.lines().filter(|l| *l == "agent-buddy").count(), 1);
+        assert!(s.lines().any(|l| l == "other-plugin"));
+        remove_line_from_file(&p, "agent-buddy").unwrap();
+        let s = std::fs::read_to_string(&p).unwrap();
+        assert!(!s.lines().any(|l| l == "agent-buddy"));
+        assert!(s.lines().any(|l| l == "other-plugin"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn bundled_plugin_assets_are_present() {
+        assert!(OPENCODE_INDEX_MJS.contains("export default"));
+        assert!(OPENCODE_PACKAGE_JSON.contains("\"type\""));
+        assert!(OPENCLAW_INDEX_JS.contains("register(api)"));
+        assert!(OPENCLAW_MANIFEST_JSON.contains("onStartup"));
+        assert!(PI_INDEX_TS.contains("export default function"));
+        assert!(HERMES_INIT_PY.contains("def register("));
+        assert!(HERMES_PLUGIN_YAML.contains("hooks:"));
+    }
+
+    #[test]
+    fn codex_features_flag_is_set_and_idempotent() {
+        // Empty config → a fresh [features] table.
+        assert_eq!(set_features_hooks_true(""), "[features]\nhooks = true\n");
+        // Already enabled → byte-identical no-op.
+        let on = "[features]\nhooks = true\n";
+        assert_eq!(set_features_hooks_true(on), on);
+        // Existing [features] with other keys → key inserted, rest preserved.
+        let other = "[features]\nweb_search = true\n";
+        let out = set_features_hooks_true(other);
+        assert!(out.contains("hooks = true"));
+        assert!(out.contains("web_search = true"));
+        // A `hooks = false` in [features] is flipped to true, not duplicated.
+        let off = "[model]\nname = \"o1\"\n\n[features]\nhooks = false\n";
+        let out = set_features_hooks_true(off);
+        assert!(out.contains("hooks = true"));
+        assert!(!out.contains("hooks = false"));
+        assert_eq!(out.matches("hooks =").count(), 1);
+        // Unrelated config with no [features] → table appended, original kept.
+        let cfg = "[model]\nname = \"gpt-5\"\n";
+        let out = set_features_hooks_true(cfg);
+        assert!(out.contains("name = \"gpt-5\""));
+        assert!(out.contains("[features]\nhooks = true"));
+        // A `hooks` key OUTSIDE [features] (different table) is left alone.
+        let elsewhere = "[other]\nhooks = false\n";
+        let out = set_features_hooks_true(elsewhere);
+        assert!(out.contains("[other]\nhooks = false"));
+        assert!(out.contains("[features]\nhooks = true"));
+    }
+
+    #[test]
+    fn install_uninstall_json_roundtrips() {
+        // Write our hooks into a temp settings file, then strip them; the user's
+        // own hook must survive both.
+        let dir = std::env::temp_dir().join(format!("ab-setup-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "hooks": { "Stop": [ { "hooks": [ { "type": "command", "command": "my-own-thing" } ] } ] }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let profile: AgentProfile = serde_json::from_str(
+            crate::agent::DEFAULT_PROFILES
+                .iter()
+                .find(|(id, _)| *id == "gemini-cli")
+                .unwrap()
+                .1,
+        )
+        .unwrap();
+
+        // Point a temp profile at our temp file.
+        let mut p = profile.clone();
+        p.install.target_path = crate::agent::TargetPath {
+            home_rel: path.to_string_lossy().into_owned(),
+            from_config_dir: false,
+            home_env: None,
+        };
+        // Absolute path: resolve_target joins home + abs → abs on Unix.
+        write_hooks_json(&p, "/x/agent-buddy").unwrap();
+        let after_install = std::fs::read_to_string(&path).unwrap();
+        assert!(after_install.contains("--agent gemini-cli"));
+        assert!(after_install.contains("my-own-thing")); // user hook preserved
+
+        strip_our_hooks_json(&path, "/x/agent-buddy").unwrap();
+        let after_strip = std::fs::read_to_string(&path).unwrap();
+        assert!(!after_strip.contains("agent-buddy"));
+        assert!(after_strip.contains("my-own-thing")); // user hook still there
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn tmp(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("ab-hooktest-{}-{name}.json", std::process::id()))
     }
@@ -1447,6 +2833,33 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
+    /// Regression: a pre-existing settings.json whose event key holds a NON-array
+    /// value (older schema, hand-edit, another tool's format) must not panic.
+    /// Before the fix this `.expect()`'d an array and crash-looped the daemon
+    /// (wire_hooks runs on every startup). Now the malformed value is overwritten
+    /// with a fresh array carrying our entry.
+    #[test]
+    fn wire_survives_non_array_event_value() {
+        let p = tmp("malformed");
+        // PreToolUse is a string, Stop is an object — both shapes we'd otherwise
+        // have unwrapped as arrays.
+        std::fs::write(
+            &p,
+            r#"{"hooks":{"PreToolUse":"oops","Stop":{"bad":true}}}"#,
+        )
+        .unwrap();
+        // Must not panic.
+        assert!(wire_hooks(&p, "/x/agent-buddy", "Bash").unwrap());
+        let v: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        let hooks = v["hooks"].as_object().unwrap();
+        // The clobbered events are now arrays each carrying our entry.
+        for ev in ["PreToolUse", "Stop"] {
+            let arr = hooks[ev].as_array().expect("event is now an array");
+            assert_eq!(arr.iter().filter(|e| is_ours(e, "")).count(), 1);
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
     /// The user's own hooks survive both wiring and stripping; only ours move.
     #[test]
     fn wire_and_strip_preserve_user_hooks() {
@@ -1470,6 +2883,158 @@ mod tests {
         assert!(stop.iter().any(|e| e["hooks"][0]["command"] == "echo hi"));
         assert!(!stop.iter().any(|e| is_ours(e, "")), "ours are gone");
         assert!(v["hooks"].get("PreToolUse").is_none(), "our-only events removed");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn resolve_target_honors_home_env() {
+        use crate::agent::TargetPath;
+        let var = format!("AB_TEST_HOME_{}", std::process::id());
+        let t = TargetPath {
+            home_rel: ".copilot/hooks/hooks.json".into(),
+            from_config_dir: false,
+            home_env: Some(var.clone()),
+        };
+        // Unset → falls back to $HOME/.copilot/hooks/hooks.json.
+        std::env::remove_var(&var);
+        assert!(resolve_target(&t)
+            .unwrap()
+            .ends_with(".copilot/hooks/hooks.json"));
+        // Set → the leading `.copilot/` segment is replaced by the env base.
+        std::env::set_var(&var, "/tmp/copilot-home");
+        assert_eq!(
+            resolve_target(&t).unwrap(),
+            PathBuf::from("/tmp/copilot-home/hooks/hooks.json")
+        );
+        std::env::remove_var(&var);
+    }
+
+    #[test]
+    fn kiro_writer_seeds_name_and_flat_entries() {
+        let p = tmp("kiro");
+        let _ = std::fs::remove_file(&p);
+        let prof = crate::agent::load_profiles()["kiro-cli"].clone();
+        write_kiro_agent_at(&p, &prof, "/x/agent-buddy").unwrap();
+        let v: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        // Top-level name is seeded from the file stem.
+        let stem = p.file_stem().unwrap().to_str().unwrap();
+        assert_eq!(v["name"], stem);
+        // Entries are flat `{ "command": ... }` (not the nested Claude shape).
+        let first_event = prof.install.events.first().unwrap();
+        let arr = v["hooks"][first_event].as_array().unwrap();
+        assert!(arr.iter().any(|e| e.get("command").is_some()));
+        assert!(arr.iter().all(|e| e.get("hooks").is_none()));
+        // Idempotent: re-running keeps exactly one of ours.
+        write_kiro_agent_at(&p, &prof, "/x/agent-buddy").unwrap();
+        let v: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        let arr = v["hooks"][first_event].as_array().unwrap();
+        assert_eq!(arr.iter().filter(|e| is_ours_cursor(e)).count(), 1);
+        // Strip removes ours, leaves name.
+        strip_kiro_agent_json(&p).unwrap();
+        let v: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        assert_eq!(v["name"], stem);
+        assert!(v["hooks"].get(first_event).is_none());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn antigravity_writer_uses_clawd_group_and_wrappers() {
+        let p = tmp("antigravity");
+        let _ = std::fs::remove_file(&p);
+        let prof = crate::agent::load_profiles()["antigravity-cli"].clone();
+        write_antigravity_hooks_at(&p, &prof, "/x/agent-buddy").unwrap();
+        let v: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        let group = v["clawd"].as_object().unwrap();
+        // PreInvocation/Stop are flat handler arrays with timeout 10.
+        let pre = group["PreInvocation"].as_array().unwrap();
+        assert_eq!(pre[0]["type"], "command");
+        assert_eq!(pre[0]["timeout"], 10);
+        assert!(pre[0].get("matcher").is_none());
+        // PostToolUse uses the {matcher,hooks} wrapper.
+        let post = group["PostToolUse"].as_array().unwrap();
+        assert_eq!(post[0]["matcher"], "*");
+        assert_eq!(post[0]["hooks"][0]["timeout"], 10);
+        // Idempotent + strip removes the group when empty.
+        write_antigravity_hooks_at(&p, &prof, "/x/agent-buddy").unwrap();
+        let v: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        assert_eq!(
+            v["clawd"]["PreInvocation"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| is_ours_antigravity(e))
+                .count(),
+            1
+        );
+        strip_antigravity_hooks_json(&p, "/x/agent-buddy").unwrap();
+        let v: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        assert!(v.get("clawd").is_none(), "empty group is dropped");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn antigravity_strip_preserves_coexisting_clawd_install() {
+        let p = tmp("antigravity-coexist");
+        // A clawd-on-desk install (not ours) in the same group must survive.
+        std::fs::write(
+            &p,
+            r#"{"clawd":{"Stop":[{"type":"command","command":"node clawd-hook.js Stop"}]}}"#,
+        )
+        .unwrap();
+        let prof = crate::agent::load_profiles()["antigravity-cli"].clone();
+        write_antigravity_hooks_at(&p, &prof, "/x/agent-buddy").unwrap();
+        strip_antigravity_hooks_json(&p, "/x/agent-buddy").unwrap();
+        let v: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        let stop = v["clawd"]["Stop"].as_array().unwrap();
+        assert!(stop.iter().any(|e| e["command"] == "node clawd-hook.js Stop"));
+        assert!(!stop.iter().any(is_ours_antigravity));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn qwen_writer_adds_matcher_and_timeouts() {
+        let p = tmp("qwen");
+        let _ = std::fs::remove_file(&p);
+        let prof = crate::agent::load_profiles()["qwen-code"].clone();
+        write_hooks_json_at(&p, &prof, "/x/agent-buddy").unwrap();
+        let v: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        let hooks = v["hooks"].as_object().unwrap();
+        // matcher:"*" on tool events; PermissionRequest gets the 600s timeout.
+        let pre = &hooks["PreToolUse"].as_array().unwrap()[0];
+        assert_eq!(pre["matcher"], "*");
+        assert_eq!(pre["hooks"][0]["timeout"], 30000);
+        let perm = &hooks["PermissionRequest"].as_array().unwrap()[0];
+        assert_eq!(perm["matcher"], "*");
+        assert_eq!(perm["hooks"][0]["timeout"], 600000);
+        // UserPromptSubmit/Stop are matcherless.
+        assert!(hooks["UserPromptSubmit"].as_array().unwrap()[0]
+            .get("matcher")
+            .is_none());
+        assert!(hooks["Stop"].as_array().unwrap()[0].get("matcher").is_none());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn copilot_writer_sets_top_level_version() {
+        let p = tmp("copilot");
+        let _ = std::fs::remove_file(&p);
+        let prof = crate::agent::load_profiles()["copilot-cli"].clone();
+        write_hooks_json_at(&p, &prof, "/x/agent-buddy").unwrap();
+        let v: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        assert_eq!(v["version"], 1);
+        assert!(v["hooks"]["sessionStart"].is_array());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn strip_our_hooks_json_is_noop_on_untouched_file() {
+        let p = tmp("noop");
+        let body = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo hi"}]}]}}"#;
+        std::fs::write(&p, body).unwrap();
+        let before = std::fs::read_to_string(&p).unwrap();
+        strip_our_hooks_json(&p, "/x/agent-buddy").unwrap();
+        // No buddy entry present → file is left byte-identical (no reformat).
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), before);
         let _ = std::fs::remove_file(&p);
     }
 }

@@ -111,6 +111,21 @@ pub enum HookEvent {
     },
 }
 
+impl HookEvent {
+    /// The session id this event belongs to (every variant carries one).
+    pub fn session_id(&self) -> &str {
+        match self {
+            HookEvent::SessionStart { session_id, .. }
+            | HookEvent::SessionEnd { session_id }
+            | HookEvent::UserPromptSubmit { session_id, .. }
+            | HookEvent::Stop { session_id, .. }
+            | HookEvent::Notification { session_id, .. }
+            | HookEvent::PermissionRequest { session_id, .. }
+            | HookEvent::Telemetry { session_id, .. } => session_id,
+        }
+    }
+}
+
 /// Response daemon -> hook.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -133,6 +148,10 @@ pub const ENDPOINT_FILE: &str = "endpoint.json";
 pub struct Endpoint {
     pub port: u16,
     pub token: String,
+    /// Loopback HTTP port plugin/extension harnesses POST events to. `None` on
+    /// older daemons (additive). Plugins read this to find the listener.
+    #[serde(default)]
+    pub http_port: Option<u16>,
 }
 
 /// Path to the daemon's published endpoint file.
@@ -193,6 +212,10 @@ pub enum DeviceCommand {
     Wifi { ssid: String, pass: String },
     /// Ask the device to enter OTA mode (free heap for the flash).
     Ota,
+    /// Switch the active agent harness: the daemon uninstalls the old harness's
+    /// hooks, installs the new one's, persists the choice, and pushes the new
+    /// theme to the device. `id` must match a loaded [`crate::agent::AgentProfile`].
+    SetAgent { id: String },
 }
 
 /// Response daemon -> (CLI) for an [`AdminRequest`].
@@ -318,6 +341,14 @@ pub struct StatusReport {
     /// bundles) to decide whether to offer the update. Additive.
     #[serde(default)]
     pub firmware_latest: Option<FirmwareLatest>,
+    /// The active agent harness id (e.g. `"claude-code"`). Drives the app's agent
+    /// selector. Defaults to `"claude-code"` for old clients. Additive.
+    #[serde(default)]
+    pub active_agent: String,
+    /// All agents the daemon can switch to (id + display name), for the selector.
+    /// Additive — old clients ignore it.
+    #[serde(default)]
+    pub available_agents: Vec<crate::agent::AgentSummary>,
 }
 
 /// A newer agent-buddy release the daemon found on GitHub, surfaced to the
@@ -353,4 +384,9 @@ pub struct FirmwareLatest {
     pub version: String,
     /// Direct download URL for the board's `firmware-<board>.bin` asset.
     pub url: String,
+    /// Download URL of the sibling `<bin>.sha256` checksum, when the release
+    /// published one. Used to verify the image before flashing; `None` for
+    /// releases that predate checksum publishing (best-effort path).
+    #[serde(default)]
+    pub sha256_url: Option<String>,
 }

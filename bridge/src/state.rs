@@ -16,6 +16,14 @@ pub fn config_dir() -> Result<PathBuf> {
         .context("could not determine a config directory")?;
     let dir = dirs.config_dir().to_path_buf();
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    // Tighten to owner-only on unix: this dir holds `endpoint.json` (the IPC
+    // token) and saved config. The token file is already 0o600, but hardening the
+    // directory keeps other local users from enumerating it. Best-effort.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
     Ok(dir)
 }
 
@@ -34,12 +42,20 @@ pub struct Config {
     /// `YYYY-MM-DD` (local) the `tokens_today` counter belongs to.
     #[serde(default)]
     pub tokens_day: String,
+    /// The active agent harness id (e.g. `"claude-code"`). Selects which hooks
+    /// the daemon installs + which theme it pushes. Defaults to `claude-code`.
+    #[serde(default = "default_agent")]
+    pub active_agent: String,
     /// Tool-name regex whose permission prompts route to the buddy, as chosen by
     /// `setup --tools`. `None` = use the built-in default. Persisted so hook
     /// reconciliation (daemon startup / app update) preserves a custom choice
     /// instead of resetting it to the default.
     #[serde(default)]
     pub hook_matcher: Option<String>,
+}
+
+fn default_agent() -> String {
+    crate::agent::DEFAULT_AGENT.to_string()
 }
 
 impl Default for Config {
@@ -53,6 +69,7 @@ impl Default for Config {
             preferred_device: None,
             tokens_today: 0,
             tokens_day: String::new(),
+            active_agent: default_agent(),
             hook_matcher: None,
         }
     }
@@ -113,6 +130,9 @@ struct Session {
     ctx_limit: u64,
     /// Monotonic activity tick for ordering the capped snapshot (newest first).
     last_active: u64,
+    /// Wall-clock epoch (seconds) the session was last seen — for idle eviction.
+    /// Distinct from `last_active` (a monotonic tick, not a clock).
+    last_seen_epoch: i64,
 }
 
 /// Context-window default and the wide-context variant.
@@ -208,6 +228,34 @@ impl SessionState {
 
     pub fn session_started(&mut self, id: &str) {
         self.sessions.entry(id.to_string()).or_default();
+    }
+
+    /// Stamp a session's wall-clock last-seen time (epoch seconds). Called once
+    /// per inbound event so idle eviction has a real clock to compare against
+    /// (the setters stay clock-free for testability).
+    pub fn touch(&mut self, id: &str, now_epoch: i64) {
+        let s = self.sessions.entry(id.to_string()).or_default();
+        s.last_seen_epoch = now_epoch;
+    }
+
+    /// Evict sessions idle longer than `window_secs` that are neither running
+    /// nor waiting, clearing the matching `session_tokens` in the same pass (it
+    /// leaks independently). Self-heals the maps for harnesses that never emit a
+    /// terminating event (e.g. Codex). A session never touched (epoch 0) is kept.
+    pub fn prune_idle(&mut self, now_epoch: i64, window_secs: i64) {
+        let cutoff = now_epoch - window_secs;
+        let drop_ids: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| {
+                !s.running && !s.waiting && s.last_seen_epoch != 0 && s.last_seen_epoch < cutoff
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in drop_ids {
+            self.sessions.remove(&id);
+            self.session_tokens.remove(&id);
+        }
     }
 
     pub fn session_ended(&mut self, id: &str) {
@@ -408,6 +456,24 @@ mod tests {
         st.session_ended("a");
         assert_eq!(st.total(), 1);
         assert_eq!(st.running(), 0);
+    }
+
+    #[test]
+    fn prune_idle_evicts_stale_idle_sessions() {
+        let mut st = SessionState::default();
+        st.session_started("old");
+        st.touch("old", 1000);
+        st.record_session_total("old", 42, "2026-06-05");
+        st.session_started("busy");
+        st.set_running("busy", true);
+        st.touch("busy", 1000);
+        // ~10min window: at now=2000 the idle "old" (last seen 1000) is evicted,
+        // the running "busy" is kept.
+        st.prune_idle(2000, 600);
+        assert_eq!(st.total(), 1);
+        // session_tokens for the dropped session is cleared too (no leak).
+        st.record_session_total("old", 0, "2026-06-05"); // fresh start, +0
+        assert_eq!(st.running(), 1);
     }
 
     #[test]

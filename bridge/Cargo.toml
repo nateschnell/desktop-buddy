@@ -42,6 +42,10 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 # MD5 of the firmware image for the ArduinoOTA (espota) handshake.
 md5 = "0.7"
+# SHA-256 to verify a downloaded OTA image against the release's published
+# checksum before flashing — catches a corrupt/truncated download (which the
+# device's transfer-only MD5 cannot, since the daemon hashes what it downloaded).
+sha2 = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }

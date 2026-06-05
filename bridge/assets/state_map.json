@@ -1,0 +1,13 @@
+{
+  "idle":           { "running": false, "waiting": false, "msg": "idle" },
+  "sleeping":       { "running": false, "waiting": false, "msg": "zzz" },
+  "thinking":       { "running": true,  "waiting": false, "msg": "thinking…" },
+  "working":        { "running": true,  "waiting": false, "msg": "working…" },
+  "juggling":       { "running": true,  "waiting": false, "msg": "working…" },
+  "sweeping":       { "running": true,  "waiting": false, "msg": "compacting…" },
+  "carrying":       { "running": true,  "waiting": false, "msg": "working…" },
+  "attention":      { "running": false, "waiting": true,  "prompt": true, "msg": "needs you" },
+  "notification":   { "keep_state": true, "msg": "notice" },
+  "error":          { "running": false, "waiting": false, "completed": false, "msg": "error" },
+  "codex-turn-end": { "running": false, "waiting": false, "completed": true, "msg": "done" }
+}

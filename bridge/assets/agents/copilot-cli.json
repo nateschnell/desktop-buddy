@@ -1,0 +1,39 @@
+{
+  "id": "copilot-cli",
+  "name": "Copilot CLI",
+  "process_names": { "win": ["copilot.exe"], "mac": ["copilot"], "linux": ["copilot"] },
+  "event_source": "hook",
+  "event_map": {
+    "sessionStart": "idle",
+    "sessionEnd": "sleeping",
+    "userPromptSubmitted": "thinking",
+    "preToolUse": "working",
+    "postToolUse": "working",
+    "errorOccurred": "error",
+    "agentStop": "attention",
+    "subagentStart": "juggling",
+    "subagentStop": "working",
+    "preCompact": "sweeping"
+  },
+  "capabilities": {
+    "permission_approval": false,
+    "interactive_bubble": false,
+    "session_end": true,
+    "subagent": true
+  },
+  "install": {
+    "config_format": "user-global-hooks-json",
+    "target_path": { "home_rel": ".copilot/hooks/hooks.json", "home_env": "COPILOT_HOME" },
+    "stdin_format": "camelCase",
+    "events": ["sessionStart", "sessionEnd", "userPromptSubmitted", "preToolUse", "postToolUse", "errorOccurred", "agentStop", "subagentStart", "subagentStop", "preCompact"]
+  },
+  "palette": {
+    "body": "#8957E5",
+    "bg": "#000000",
+    "text": "#FFFFFF",
+    "text_dim": "#808080",
+    "ink": "#000000"
+  },
+  "panels": ["sessions", "subagents"],
+  "revision": 1
+}

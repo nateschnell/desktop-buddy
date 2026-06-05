@@ -1,0 +1,12 @@
+name: agent-buddy
+version: "1.0.0"
+description: "Forward Hermes lifecycle and tool-state events to the Agent Buddy hardware device."
+author: "Agent Buddy"
+hooks:
+  - on_session_start
+  - on_session_reset
+  - pre_llm_call
+  - pre_tool_call
+  - post_tool_call
+  - on_session_end
+  - on_session_finalize

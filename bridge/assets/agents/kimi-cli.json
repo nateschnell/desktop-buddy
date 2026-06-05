@@ -1,0 +1,43 @@
+{
+  "id": "kimi-cli",
+  "name": "Kimi CLI",
+  "process_names": { "win": ["kimi.exe"], "mac": ["kimi", "Kimi Code"], "linux": ["kimi"] },
+  "event_source": "hook",
+  "event_map": {
+    "SessionStart": "idle",
+    "SessionEnd": "sleeping",
+    "UserPromptSubmit": "thinking",
+    "PreToolUse": "working",
+    "PostToolUse": "working",
+    "PostToolUseFailure": "error",
+    "Stop": "attention",
+    "StopFailure": "error",
+    "SubagentStart": "juggling",
+    "SubagentStop": "working",
+    "PreCompact": "sweeping",
+    "PostCompact": "attention",
+    "Notification": "notification"
+  },
+  "capabilities": {
+    "http_hook": true,
+    "permission_approval": false,
+    "notification_hook": true,
+    "session_end": true,
+    "subagent": true
+  },
+  "install": {
+    "config_format": "kimi-toml",
+    "target_path": { "home_rel": ".kimi/config.toml" },
+    "stdin_format": "claudeCodeHookJson",
+    "events": ["SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "SubagentStop", "Notification"]
+  },
+  "palette": {
+    "body": "#6C8CFF",
+    "bg": "#000000",
+    "text": "#FFFFFF",
+    "text_dim": "#808080",
+    "ink": "#000000"
+  },
+  "panels": ["sessions", "subagents"],
+  "revision": 1
+}

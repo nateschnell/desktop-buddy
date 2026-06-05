@@ -1,8 +1,8 @@
 //! The Hardware Buddy BLE wire protocol.
 //!
-//! This is the *exact* protocol the Claude desktop apps speak (see
-//! `REFERENCE.md`), re-implemented here so our daemon can play the same
-//! central role. Everything on the wire is UTF-8 JSON, one object per line,
+//! This is the *exact* protocol the Hardware Buddy firmware and the Claude
+//! desktop apps speak over BLE, re-implemented here so our daemon can play the
+//! same central role. Everything on the wire is UTF-8 JSON, one object per line,
 //! terminated with `\n`.
 //!
 //! Directions are from the daemon's point of view:
@@ -35,9 +35,8 @@ pub const DEVICE_NAME_PREFIX: &str = "Claude";
 /// this in bytes. Kept comfortably under the firmware buffer so MTU-chunked
 /// writes and the trailing `\n` still fit.
 ///
-/// WIRE COUPLING: the firmware `_LineBuf` MUST stay strictly larger than this
-/// (see `firmware/src/data.h`). Documented as the single source of truth in
-/// `REFERENCE.md`. If the two drift, multibyte heartbeats silently drop.
+/// WIRE COUPLING: the firmware's line-reassembly buffer MUST stay strictly
+/// larger than this. If the two drift, multibyte heartbeats silently drop.
 pub const MAX_LINE_BYTES: usize = 1900;
 
 // ---------------------------------------------------------------------------
@@ -157,6 +156,27 @@ pub enum OutboundCmd {
     /// after the device reboots into the new image).
     Ota,
     Unpair,
+    /// Per-agent theme: `{"cmd":"theme","id":"codex","label":"Codex CLI",
+    /// "pal":[body,bg,text,textDim,ink],"hot":..,"panel":..,"sel":..,"ok":..,
+    /// "panels":<bits>,"caps":<bits>,"pack":"codex"}`. All colors are RGB565
+    /// decimals. The device repaints in these colors, shows the info panels named
+    /// by the `panels` bitmask, and loads the named animation `pack` from its
+    /// asset store. Sent on connect and whenever the active agent changes. Tiny
+    /// (~120 B) — comfortably under [`MAX_LINE_BYTES`].
+    Theme {
+        id: String,
+        label: String,
+        /// body, bg, text, textDim, ink — firmware `Palette` order.
+        pal: [u16; 5],
+        hot: u16,
+        panel: u16,
+        sel: u16,
+        ok: u16,
+        panels: u32,
+        caps: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pack: Option<String>,
+    },
     // --- folder push (GIF character packs) ---
     CharBegin {
         name: String,
@@ -343,6 +363,42 @@ mod tests {
         // Compile-time invariant: a const guard so a future bump that crosses
         // the firmware buffer fails to build, not just at test time.
         const _: () = assert!(MAX_LINE_BYTES < 2048);
+    }
+
+    #[test]
+    fn theme_serializes_and_fits_the_wire() {
+        let t = OutboundCmd::Theme {
+            id: "claude-code".into(),
+            label: "Claude Code".into(),
+            pal: [0xC2A6, 0x0000, 0xFFFF, 0x8410, 0x0000],
+            hot: 0xFA20,
+            panel: 0x2104,
+            sel: 0x4208,
+            ok: 0x07E0,
+            panels: 0b10111,
+            caps: 0b110110,
+            pack: Some("claude-code".into()),
+        };
+        let line = to_line(&t).unwrap();
+        assert!(line.len() < MAX_LINE_BYTES, "theme line too big: {}", line.len());
+        let s = String::from_utf8(line).unwrap();
+        assert!(s.contains(r#""cmd":"theme""#));
+        assert!(s.contains(r#""pal":[49830,0,65535,33808,0]"#));
+        // pack omitted when None.
+        let t2 = OutboundCmd::Theme {
+            id: "x".into(),
+            label: "X".into(),
+            pal: [0; 5],
+            hot: 0,
+            panel: 0,
+            sel: 0,
+            ok: 0,
+            panels: 0,
+            caps: 0,
+            pack: None,
+        };
+        let s2 = String::from_utf8(to_line(&t2).unwrap()).unwrap();
+        assert!(!s2.contains("pack"));
     }
 
     #[test]
