@@ -2,10 +2,12 @@
 //! always has real art even with an empty config dir (the procedural fallback in
 //! `widget.rs` covers anything this doesn't).
 //!
-//! Curated from a sprite-forge pack into `bridge/assets/widget/<state>/`
-//! (claude-code, 4 frames/state @ 200ms). `frames(state)` returns
-//! `(&[frame_bytes], frame_ms)` or `None` (→ procedural). Paths are relative to
-//! this file (`src/`).
+//! The built-in buddy is **clawd** — the real Claude mascot (terracotta sunburst
+//! creature; `busy` wears the clawd-tank hardhat) — curated from the
+//! `clawd-hybrid` sprite-forge pack into `bridge/assets/widget/<state>/`. Frames
+//! are downscaled to the render height and palette-quantized; `frames(state)`
+//! returns `(&[frame_bytes], frame_ms)` or `None` (-> procedural). Paths are
+//! relative to this file (`src/`).
 
 /// One bundled state's frames + per-frame duration.
 type State = (&'static [&'static [u8]], u32);
@@ -17,9 +19,6 @@ macro_rules! frames {
     };
 }
 
-/// Per-frame duration of the bundled pack (claude-code `pipeline-meta.json`).
-const MS: u32 = 200;
-
 pub fn frames(state: &str) -> Option<State> {
     Some(match state {
         "sleep" => (
@@ -28,8 +27,32 @@ pub fn frames(state: &str) -> Option<State> {
                 "../assets/widget/sleep/sleep-2.png",
                 "../assets/widget/sleep/sleep-3.png",
                 "../assets/widget/sleep/sleep-4.png",
+                "../assets/widget/sleep/sleep-5.png",
+                "../assets/widget/sleep/sleep-6.png",
+                "../assets/widget/sleep/sleep-7.png",
+                "../assets/widget/sleep/sleep-8.png",
+                "../assets/widget/sleep/sleep-9.png",
+                "../assets/widget/sleep/sleep-10.png",
+                "../assets/widget/sleep/sleep-11.png",
+                "../assets/widget/sleep/sleep-12.png",
+                "../assets/widget/sleep/sleep-13.png",
+                "../assets/widget/sleep/sleep-14.png",
+                "../assets/widget/sleep/sleep-15.png",
+                "../assets/widget/sleep/sleep-16.png",
+                "../assets/widget/sleep/sleep-17.png",
+                "../assets/widget/sleep/sleep-18.png",
+                "../assets/widget/sleep/sleep-19.png",
+                "../assets/widget/sleep/sleep-20.png",
+                "../assets/widget/sleep/sleep-21.png",
+                "../assets/widget/sleep/sleep-22.png",
+                "../assets/widget/sleep/sleep-23.png",
+                "../assets/widget/sleep/sleep-24.png",
+                "../assets/widget/sleep/sleep-25.png",
+                "../assets/widget/sleep/sleep-26.png",
+                "../assets/widget/sleep/sleep-27.png",
+                "../assets/widget/sleep/sleep-28.png",
             ],
-            MS,
+            110,
         ),
         "idle" => (
             frames![
@@ -37,8 +60,28 @@ pub fn frames(state: &str) -> Option<State> {
                 "../assets/widget/idle/idle-2.png",
                 "../assets/widget/idle/idle-3.png",
                 "../assets/widget/idle/idle-4.png",
+                "../assets/widget/idle/idle-5.png",
+                "../assets/widget/idle/idle-6.png",
+                "../assets/widget/idle/idle-7.png",
+                "../assets/widget/idle/idle-8.png",
+                "../assets/widget/idle/idle-9.png",
+                "../assets/widget/idle/idle-10.png",
+                "../assets/widget/idle/idle-11.png",
+                "../assets/widget/idle/idle-12.png",
+                "../assets/widget/idle/idle-13.png",
+                "../assets/widget/idle/idle-14.png",
+                "../assets/widget/idle/idle-15.png",
+                "../assets/widget/idle/idle-16.png",
+                "../assets/widget/idle/idle-17.png",
+                "../assets/widget/idle/idle-18.png",
+                "../assets/widget/idle/idle-19.png",
+                "../assets/widget/idle/idle-20.png",
+                "../assets/widget/idle/idle-21.png",
+                "../assets/widget/idle/idle-22.png",
+                "../assets/widget/idle/idle-23.png",
+                "../assets/widget/idle/idle-24.png",
             ],
-            MS,
+            90,
         ),
         "busy" => (
             frames![
@@ -46,8 +89,20 @@ pub fn frames(state: &str) -> Option<State> {
                 "../assets/widget/busy/busy-2.png",
                 "../assets/widget/busy/busy-3.png",
                 "../assets/widget/busy/busy-4.png",
+                "../assets/widget/busy/busy-5.png",
+                "../assets/widget/busy/busy-6.png",
+                "../assets/widget/busy/busy-7.png",
+                "../assets/widget/busy/busy-8.png",
+                "../assets/widget/busy/busy-9.png",
+                "../assets/widget/busy/busy-10.png",
+                "../assets/widget/busy/busy-11.png",
+                "../assets/widget/busy/busy-12.png",
+                "../assets/widget/busy/busy-13.png",
+                "../assets/widget/busy/busy-14.png",
+                "../assets/widget/busy/busy-15.png",
+                "../assets/widget/busy/busy-16.png",
             ],
-            MS,
+            70,
         ),
         "attention" => (
             frames![
@@ -55,8 +110,22 @@ pub fn frames(state: &str) -> Option<State> {
                 "../assets/widget/attention/attention-2.png",
                 "../assets/widget/attention/attention-3.png",
                 "../assets/widget/attention/attention-4.png",
+                "../assets/widget/attention/attention-5.png",
+                "../assets/widget/attention/attention-6.png",
+                "../assets/widget/attention/attention-7.png",
+                "../assets/widget/attention/attention-8.png",
+                "../assets/widget/attention/attention-9.png",
+                "../assets/widget/attention/attention-10.png",
+                "../assets/widget/attention/attention-11.png",
+                "../assets/widget/attention/attention-12.png",
+                "../assets/widget/attention/attention-13.png",
+                "../assets/widget/attention/attention-14.png",
+                "../assets/widget/attention/attention-15.png",
+                "../assets/widget/attention/attention-16.png",
+                "../assets/widget/attention/attention-17.png",
+                "../assets/widget/attention/attention-18.png",
             ],
-            MS,
+            70,
         ),
         "celebrate" => (
             frames![
@@ -64,8 +133,24 @@ pub fn frames(state: &str) -> Option<State> {
                 "../assets/widget/celebrate/celebrate-2.png",
                 "../assets/widget/celebrate/celebrate-3.png",
                 "../assets/widget/celebrate/celebrate-4.png",
+                "../assets/widget/celebrate/celebrate-5.png",
+                "../assets/widget/celebrate/celebrate-6.png",
+                "../assets/widget/celebrate/celebrate-7.png",
+                "../assets/widget/celebrate/celebrate-8.png",
+                "../assets/widget/celebrate/celebrate-9.png",
+                "../assets/widget/celebrate/celebrate-10.png",
+                "../assets/widget/celebrate/celebrate-11.png",
+                "../assets/widget/celebrate/celebrate-12.png",
+                "../assets/widget/celebrate/celebrate-13.png",
+                "../assets/widget/celebrate/celebrate-14.png",
+                "../assets/widget/celebrate/celebrate-15.png",
+                "../assets/widget/celebrate/celebrate-16.png",
+                "../assets/widget/celebrate/celebrate-17.png",
+                "../assets/widget/celebrate/celebrate-18.png",
+                "../assets/widget/celebrate/celebrate-19.png",
+                "../assets/widget/celebrate/celebrate-20.png",
             ],
-            MS,
+            60,
         ),
         "dizzy" => (
             frames![
@@ -73,8 +158,28 @@ pub fn frames(state: &str) -> Option<State> {
                 "../assets/widget/dizzy/dizzy-2.png",
                 "../assets/widget/dizzy/dizzy-3.png",
                 "../assets/widget/dizzy/dizzy-4.png",
+                "../assets/widget/dizzy/dizzy-5.png",
+                "../assets/widget/dizzy/dizzy-6.png",
+                "../assets/widget/dizzy/dizzy-7.png",
+                "../assets/widget/dizzy/dizzy-8.png",
+                "../assets/widget/dizzy/dizzy-9.png",
+                "../assets/widget/dizzy/dizzy-10.png",
+                "../assets/widget/dizzy/dizzy-11.png",
+                "../assets/widget/dizzy/dizzy-12.png",
+                "../assets/widget/dizzy/dizzy-13.png",
+                "../assets/widget/dizzy/dizzy-14.png",
+                "../assets/widget/dizzy/dizzy-15.png",
+                "../assets/widget/dizzy/dizzy-16.png",
+                "../assets/widget/dizzy/dizzy-17.png",
+                "../assets/widget/dizzy/dizzy-18.png",
+                "../assets/widget/dizzy/dizzy-19.png",
+                "../assets/widget/dizzy/dizzy-20.png",
+                "../assets/widget/dizzy/dizzy-21.png",
+                "../assets/widget/dizzy/dizzy-22.png",
+                "../assets/widget/dizzy/dizzy-23.png",
+                "../assets/widget/dizzy/dizzy-24.png",
             ],
-            MS,
+            70,
         ),
         "heart" => (
             frames![
@@ -82,8 +187,26 @@ pub fn frames(state: &str) -> Option<State> {
                 "../assets/widget/heart/heart-2.png",
                 "../assets/widget/heart/heart-3.png",
                 "../assets/widget/heart/heart-4.png",
+                "../assets/widget/heart/heart-5.png",
+                "../assets/widget/heart/heart-6.png",
+                "../assets/widget/heart/heart-7.png",
+                "../assets/widget/heart/heart-8.png",
+                "../assets/widget/heart/heart-9.png",
+                "../assets/widget/heart/heart-10.png",
+                "../assets/widget/heart/heart-11.png",
+                "../assets/widget/heart/heart-12.png",
+                "../assets/widget/heart/heart-13.png",
+                "../assets/widget/heart/heart-14.png",
+                "../assets/widget/heart/heart-15.png",
+                "../assets/widget/heart/heart-16.png",
+                "../assets/widget/heart/heart-17.png",
+                "../assets/widget/heart/heart-18.png",
+                "../assets/widget/heart/heart-19.png",
+                "../assets/widget/heart/heart-20.png",
+                "../assets/widget/heart/heart-21.png",
+                "../assets/widget/heart/heart-22.png",
             ],
-            MS,
+            80,
         ),
         _ => return None,
     })
