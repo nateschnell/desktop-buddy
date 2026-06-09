@@ -57,14 +57,14 @@ jobs:
           echo "fetched:"; ls -l dist
 
       - name: Upload firmware artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: firmware
           path: dist/
 
       - name: Attach firmware to release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           # A firmware-only (fw-*) release must not steal "latest" from the
           # desktop track (install.sh reads /releases/latest for the CLI archive).
@@ -111,7 +111,7 @@ jobs:
       run:
         working-directory: bridge
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -144,7 +144,7 @@ jobs:
         run: cargo build --release --features gui --target ${{ matrix.target }}
 
       - name: Download firmware
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: firmware
           path: bridge/fw
@@ -170,13 +170,13 @@ jobs:
 
       - name: Attach CLI archive to release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: bridge/agent-buddy-${{ matrix.target }}.${{ matrix.ext }}
 
       - name: Upload CLI archive (manual runs)
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: cli-${{ matrix.target }}
           path: bridge/agent-buddy-${{ matrix.target }}.${{ matrix.ext }}
@@ -198,7 +198,7 @@ jobs:
           Copy-Item target/${{ matrix.target }}/release/agent-buddy-app.exe bin/
 
       - name: Upload raw binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: bin-${{ matrix.target }}
           path: bridge/bin/
@@ -212,7 +212,7 @@ jobs:
     if: ${{ !startsWith(github.ref, 'refs/tags/fw-') }}
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Resolve version
         id: ver
         run: |
@@ -221,11 +221,11 @@ jobs:
           else
             echo "version=$(git describe --tags --always --dirty 2>/dev/null || echo dev)" >> "$GITHUB_OUTPUT"
           fi
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with: { name: bin-aarch64-apple-darwin, path: arm64 }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with: { name: bin-x86_64-apple-darwin, path: x86_64 }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with: { name: firmware, path: fw }
       - name: Lipo to universal binaries
         run: |
@@ -307,12 +307,12 @@ jobs:
           spctl -a -t open --context context:primary-signature -vv "$DMG"
       - name: Attach .dmg to release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: out/*.dmg
       - name: Upload .dmg (manual runs)
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: macos-dmg
           path: out/*.dmg
@@ -324,7 +324,7 @@ jobs:
     if: ${{ !startsWith(github.ref, 'refs/tags/fw-') }}
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Resolve version
         id: ver
         shell: bash
@@ -334,9 +334,9 @@ jobs:
           else
             echo "version=$(git describe --tags --always --dirty 2>/dev/null || echo dev)" >> "$GITHUB_OUTPUT"
           fi
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with: { name: bin-x86_64-pc-windows-msvc, path: stage }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with: { name: firmware, path: stage }
       - name: Install Inno Setup
         run: choco install innosetup --no-progress -y
@@ -348,12 +348,12 @@ jobs:
           packaging\windows\installer.iss
       - name: Attach Setup.exe to release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: packaging/windows/Agent-Buddy-Setup-*.exe
       - name: Upload Setup.exe (manual runs)
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: windows-setup
           path: packaging/windows/Agent-Buddy-Setup-*.exe
@@ -365,7 +365,7 @@ jobs:
     if: ${{ !startsWith(github.ref, 'refs/tags/fw-') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Resolve version
         id: ver
         run: |
@@ -374,9 +374,9 @@ jobs:
           else
             echo "version=$(git describe --tags --always --dirty 2>/dev/null || echo dev)" >> "$GITHUB_OUTPUT"
           fi
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with: { name: bin-x86_64-unknown-linux-gnu, path: bin }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with: { name: firmware, path: fw }
       - name: Install packaging tools
         run: |
@@ -393,12 +393,12 @@ jobs:
             --version "${{ steps.ver.outputs.version }}"
       - name: Attach AppImage to release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: out/*.AppImage
       - name: Upload AppImage (manual runs)
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: linux-appimage
           path: out/*.AppImage
