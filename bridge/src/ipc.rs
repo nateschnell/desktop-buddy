@@ -325,6 +325,15 @@ pub struct StatusReport {
     pub sessions_waiting: u32,
     /// Recent activity ticker, newest first.
     pub entries: Vec<String>,
+    /// A turn just completed (the daemon's ~5s celebrate window is open). Drives
+    /// the desktop widget's celebrate/heart one-shot. Additive — old clients
+    /// ignore it.
+    #[serde(default)]
+    pub recently_completed: bool,
+    /// A turn just ended in error (the daemon's ~3s dizzy window is open). Drives
+    /// the desktop widget's dizzy one-shot. Additive.
+    #[serde(default)]
+    pub recent_error: bool,
     /// The Wi-Fi the device announced joining this session, if any (for OTA).
     pub device_ssid: Option<String>,
     pub device_ip: Option<String>,

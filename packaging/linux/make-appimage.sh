@@ -29,6 +29,7 @@ done
 
 GUI="$BIN_DIR/agent-buddy-app"
 DAEMON="$BIN_DIR/agent-buddy"
+WIDGET="$BIN_DIR/agent-buddy-widget"
 [ -f "$GUI" ]    || { echo "missing GUI binary: $GUI" >&2; exit 1; }
 [ -f "$DAEMON" ] || { echo "missing daemon binary: $DAEMON" >&2; exit 1; }
 
@@ -36,6 +37,8 @@ APPDIR="$(mktemp -d)/Agent Buddy.AppDir"
 mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/agent-buddy"
 install -m 0755 "$GUI"    "$APPDIR/usr/bin/agent-buddy-app"
 install -m 0755 "$DAEMON" "$APPDIR/usr/bin/agent-buddy"
+# The floating desktop buddy — a sibling process the app spawns. Optional.
+[ -f "$WIDGET" ] && install -m 0755 "$WIDGET" "$APPDIR/usr/bin/agent-buddy-widget"
 
 if [ -n "$FW_DIR" ] && [ -d "$FW_DIR" ]; then
   shopt -s nullglob

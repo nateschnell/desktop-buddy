@@ -23,3 +23,5 @@ pub mod selfupdate;
 pub mod setup;
 pub mod state;
 pub mod update;
+#[cfg(feature = "gui")]
+pub mod widget;

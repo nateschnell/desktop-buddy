@@ -385,6 +385,54 @@ fn save_theme_pref(t: ThemePref) {
     }
 }
 
+/// Whether the floating desktop buddy was left enabled (defaults off — opt-in).
+fn load_widget_enabled() -> bool {
+    state::config_dir()
+        .ok()
+        .map(|d| d.join("widget_enabled").exists())
+        .unwrap_or(false)
+}
+
+/// Persist the desktop-buddy on/off choice (presence of the marker file = on).
+fn save_widget_enabled(on: bool) {
+    if let Ok(d) = state::config_dir() {
+        let path = d.join("widget_enabled");
+        if on {
+            let _ = std::fs::write(path, "1");
+        } else {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Path to the `agent-buddy-widget` binary, preferring the copy beside this one
+/// (so a bundle finds its sibling), falling back to a bare name on `PATH`.
+fn widget_exe_path() -> std::path::PathBuf {
+    let name = if cfg!(windows) {
+        "agent-buddy-widget.exe"
+    } else {
+        "agent-buddy-widget"
+    };
+    if let Ok(here) = std::env::current_exe() {
+        if let Some(dir) = here.parent() {
+            let candidate = dir.join(name);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    std::path::PathBuf::from(name)
+}
+
+/// Spawn the desktop-buddy widget process. `BUDDY_WIDGET_MANAGED` tells it to
+/// self-exit if this app dies, so it can't orphan on screen. Best-effort.
+fn spawn_widget() -> Option<std::process::Child> {
+    std::process::Command::new(widget_exe_path())
+        .env("BUDDY_WIDGET_MANAGED", "1")
+        .spawn()
+        .ok()
+}
+
 struct App {
     tx: Sender<Cmd>,
     rx: Receiver<Msg>,
@@ -432,6 +480,12 @@ struct App {
     /// which has no tray.
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     tray_state: TrayState,
+    /// The floating desktop-buddy widget child process, while it's showing. The
+    /// widget is a separate process (a transparent main viewport — egui can't
+    /// make a child viewport transparent), spawned/killed from here.
+    widget_proc: Option<std::process::Child>,
+    /// Whether the desktop buddy should be showing, remembered across launches.
+    widget_enabled: bool,
 }
 
 /// What a tray menu item does when clicked.
@@ -439,6 +493,7 @@ enum TrayAction {
     Open,
     Start,
     Stop,
+    ToggleWidget,
     Uninstall,
     Quit,
 }
@@ -490,6 +545,10 @@ impl App {
 
         let (tray, tray_rx) = init_tray(&cc.egui_ctx);
 
+        // Bring up the floating desktop buddy if it was left enabled.
+        let widget_enabled = load_widget_enabled();
+        let widget_proc = if widget_enabled { spawn_widget() } else { None };
+
         let detected_ssid = client::current_ssid();
         App {
             tx,
@@ -514,6 +573,34 @@ impl App {
             was_focused: true,
             last_update_recheck: Some(Instant::now()),
             tray_state: TrayState::Off,
+            widget_proc,
+            widget_enabled,
+        }
+    }
+
+    /// Show or hide the floating desktop buddy, remembering the choice. Spawning
+    /// is best-effort; the widget single-instances itself, so a redundant spawn
+    /// is harmless.
+    fn set_widget_enabled(&mut self, on: bool) {
+        if on == self.widget_enabled && (!on || self.widget_proc.is_some()) {
+            return;
+        }
+        self.widget_enabled = on;
+        save_widget_enabled(on);
+        if on {
+            if self.widget_proc.is_none() {
+                self.widget_proc = spawn_widget();
+            }
+        } else {
+            self.kill_widget();
+        }
+    }
+
+    /// Stop the buddy widget process if we started one.
+    fn kill_widget(&mut self) {
+        if let Some(mut child) = self.widget_proc.take() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 
@@ -1342,6 +1429,33 @@ impl App {
             );
         });
 
+        // Desktop buddy — the floating mascot. The control here works on every
+        // platform (the tray toggle isn't available on Linux), so there's always
+        // a way to turn it on/off.
+        ui.add_space(10.0);
+        let mut want_widget = self.widget_enabled;
+        card(ui, p, |ui| {
+            ui.label(
+                egui::RichText::new("Desktop buddy")
+                    .color(p.ink)
+                    .size(15.0)
+                    .family(bold()),
+            );
+            ui.add_space(8.0);
+            ui.checkbox(&mut want_widget, "Show the floating desktop buddy");
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "A small always-on-top character that reacts to your coding sessions. Drag it anywhere; nudge it to a screen edge to tuck it away.",
+                )
+                .color(p.muted)
+                .size(11.0),
+            );
+        });
+        if want_widget != self.widget_enabled {
+            self.set_widget_enabled(want_widget);
+        }
+
         // Agent — which coding harness the buddy follows. Switching re-wires that
         // harness's hooks and re-themes the device. Only shown with a running
         // gateway (it's what supplies the available-agents list).
@@ -1526,6 +1640,10 @@ impl App {
                 }
                 TrayAction::Start => self.send(Cmd::Start),
                 TrayAction::Stop => self.send(Cmd::Stop),
+                TrayAction::ToggleWidget => {
+                    let on = !self.widget_enabled;
+                    self.set_widget_enabled(on);
+                }
                 TrayAction::Uninstall => {
                     // Surface the window on Settings with the confirmation up,
                     // rather than tearing down from a menu click without warning.
@@ -1534,7 +1652,10 @@ impl App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
-                TrayAction::Quit => std::process::exit(0),
+                TrayAction::Quit => {
+                    self.kill_widget();
+                    std::process::exit(0);
+                }
             }
         }
 
@@ -1574,6 +1695,8 @@ fn build_tray() -> Result<tray_icon::TrayIcon, Box<dyn std::error::Error>> {
     menu.append(&MenuItem::with_id("start", "Start gateway", true, None))?;
     menu.append(&MenuItem::with_id("stop", "Stop gateway", true, None))?;
     menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&MenuItem::with_id("widget", "Show/hide desktop buddy", true, None))?;
+    menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&MenuItem::with_id("uninstall", "Uninstall Agent Buddy…", true, None))?;
     menu.append(&MenuItem::with_id("quit", "Quit Agent Buddy", true, None))?;
 
@@ -1602,6 +1725,7 @@ fn spawn_menu_pump(ctx: egui::Context) -> Receiver<TrayAction> {
                 "open" => TrayAction::Open,
                 "start" => TrayAction::Start,
                 "stop" => TrayAction::Stop,
+                "widget" => TrayAction::ToggleWidget,
                 "uninstall" => TrayAction::Uninstall,
                 "quit" => TrayAction::Quit,
                 _ => continue,

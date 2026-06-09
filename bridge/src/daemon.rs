@@ -800,9 +800,14 @@ fn build_status(
     firmware_latest: &HashMap<String, FirmwareLatest>,
     profiles: &HashMap<String, AgentProfile>,
 ) -> StatusReport {
+    let now = local_now().0;
     StatusReport {
         device_connected,
         owner: config.owner.clone(),
+        // Persona one-shot signals for the desktop widget (mirrors the device's
+        // celebrate/dizzy pulses). Windowed in `SessionState`; recomputed here.
+        recently_completed: state.recently_completed(now),
+        recent_error: state.recent_error(now),
         active_agent: config.active_agent.clone(),
         available_agents: agent::list_agents(profiles),
         tokens_today: state.tokens_today,
@@ -999,6 +1004,13 @@ async fn handle_hook(
                 state.mark_completed(epoch + 5); // ~5s celebrate window
             }
             if let Some(s) = summary {
+                // The ingest layer collapses a NormState::Error turn into a Stop
+                // carrying the literal "error" marker (ingest.rs). Use it to arm
+                // the desktop widget's dizzy one-shot; real summaries are just
+                // pushed to the ticker.
+                if s == "error" {
+                    state.mark_error(epoch + 3); // ~3s dizzy window
+                }
                 state.push_entry(s);
             }
             let _ = responder.send(HookResponse::Ack);

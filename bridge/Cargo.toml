@@ -18,10 +18,18 @@ name = "agent-buddy-app"
 path = "src/bin/app.rs"
 required-features = ["gui"]
 
+# Floating desktop buddy widget. A separate process (a transparent main viewport
+# — see `src/widget.rs`) the control panel spawns; also runnable directly.
+[[bin]]
+name = "agent-buddy-widget"
+path = "src/bin/widget.rs"
+required-features = ["gui"]
+
 [features]
 default = ["pack"]
-# Pulls in the native GUI toolkit + tray for the `agent-buddy-app` binary.
-gui = ["dep:eframe", "dep:tray-icon"]
+# Pulls in the native GUI toolkit + tray for the GUI binaries. `image` decodes
+# the widget's animation frame PNGs (shared with `pack`'s optional dep).
+gui = ["dep:eframe", "dep:tray-icon", "dep:image"]
 # Animation-pack authoring + push: PNG decode (build) + base64 (BLE chunking).
 # Gated so a minimal daemon build can drop the PNG codec, but on by default
 # because the CLI + desktop app both expose `pack build`/`pack push`.

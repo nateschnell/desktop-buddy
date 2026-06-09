@@ -193,6 +193,8 @@ pub struct SessionState {
     session_tokens: HashMap<String, u64>,
     /// Epoch second until which a turn-completion (celebrate) is signaled.
     completed_until: i64,
+    /// Epoch second until which a recent error (dizzy) is signaled.
+    error_until: i64,
     /// Monotonic counter stamped onto a session whenever it sees activity, so
     /// the snapshot can order by recency without pulling a clock in here.
     activity_tick: u64,
@@ -417,6 +419,16 @@ impl SessionState {
     /// Whether the celebrate window is still open at `now` (epoch seconds).
     pub fn recently_completed(&self, now: i64) -> bool {
         now < self.completed_until
+    }
+
+    /// Signal a turn ended in error (dizzy) until `epoch`.
+    pub fn mark_error(&mut self, until_epoch: i64) {
+        self.error_until = until_epoch;
+    }
+
+    /// Whether the error (dizzy) window is still open at `now` (epoch seconds).
+    pub fn recent_error(&self, now: i64) -> bool {
+        now < self.error_until
     }
 
     pub fn total(&self) -> u32 {

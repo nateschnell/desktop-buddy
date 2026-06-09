@@ -39,6 +39,7 @@ done
 
 GUI="$BIN_DIR/agent-buddy-app"
 DAEMON="$BIN_DIR/agent-buddy"
+WIDGET="$BIN_DIR/agent-buddy-widget"
 [ -f "$GUI" ]    || { echo "missing GUI binary: $GUI" >&2; exit 1; }
 [ -f "$DAEMON" ] || { echo "missing daemon binary: $DAEMON" >&2; exit 1; }
 
@@ -56,6 +57,12 @@ mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources"
 
 install -m 0755 "$GUI"    "$CONTENTS/MacOS/agent-buddy-app"
 install -m 0755 "$DAEMON" "$CONTENTS/MacOS/agent-buddy"
+# The floating desktop buddy is a sibling binary the app spawns (it must be its
+# own process — a transparent main viewport). Optional so a build without it
+# still bundles; the app falls back gracefully if it's absent.
+if [ -f "$WIDGET" ]; then
+  install -m 0755 "$WIDGET" "$CONTENTS/MacOS/agent-buddy-widget"
+fi
 
 # Bring along every firmware image + version so the app's one-click OTA has an
 # image to flash for whichever board connects (see ota::bundled_firmware_path).
@@ -124,6 +131,8 @@ if [ "$IDENTITY" != "-" ]; then
   # signing the bundle covers its main executable (agent-buddy-app).
   codesign --force "${HARDENED[@]}" --sign "$IDENTITY" \
     "$CONTENTS/MacOS/agent-buddy"
+  [ -f "$CONTENTS/MacOS/agent-buddy-widget" ] && codesign --force "${HARDENED[@]}" --sign "$IDENTITY" \
+    "$CONTENTS/MacOS/agent-buddy-widget"
   codesign --force "${HARDENED[@]}" --sign "$IDENTITY" \
     --identifier com.nateschnell.agent-buddy-app "$APP"
   codesign --verify --strict --verbose=2 "$APP"
