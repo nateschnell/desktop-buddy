@@ -19,9 +19,13 @@ path = "src/bin/app.rs"
 required-features = ["gui"]
 
 [features]
-default = []
+default = ["pack"]
 # Pulls in the native GUI toolkit + tray for the `agent-buddy-app` binary.
 gui = ["dep:eframe", "dep:tray-icon"]
+# Animation-pack authoring + push: PNG decode (build) + base64 (BLE chunking).
+# Gated so a minimal daemon build can drop the PNG codec, but on by default
+# because the CLI + desktop app both expose `pack build`/`pack push`.
+pack = ["dep:image", "dep:base64"]
 
 [dependencies]
 # Async runtime — the daemon juggles BLE I/O, an IPC server, and timers.
@@ -61,6 +65,11 @@ time = { version = "0.3", features = ["local-offset"] }
 # (`agent-buddy-app`). Optional: only compiled in under the `gui` feature.
 eframe = { version = "0.28", optional = true }
 tray-icon = { version = "0.14", optional = true }
+
+# Animation-pack authoring (`pack` feature). PNG-only decode keeps the
+# dependency small; base64 encodes the .spr chunks for the BLE push.
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+base64 = { version = "0.22", optional = true }
 
 # flock(2) for the daemon's single-instance lock. Already pulled in
 # transitively by tokio/btleplug, so this adds no new download.

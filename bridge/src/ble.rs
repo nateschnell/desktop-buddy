@@ -131,6 +131,12 @@ pub struct BleLink {
     /// reconnect every minute or two. Holding it here keeps the link alive.
     #[allow(dead_code)]
     adapter: Adapter,
+    /// Serializes whole-line writes. `write_line` splits a line into MTU-sized
+    /// `WithoutResponse` packets; without this lock two concurrent writers (e.g.
+    /// the owner loop's heartbeat and a pack-push task, which both hold a clone
+    /// of this link) could interleave their packets on the wire and corrupt both
+    /// lines. Shared across clones via `Arc`, so the serialization is per-device.
+    write_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 impl BleLink {
@@ -231,6 +237,7 @@ impl BleLink {
                 peripheral,
                 rx_char,
                 adapter,
+                write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             },
             line_rx,
             id,
@@ -248,6 +255,9 @@ impl BleLink {
     /// Write one already-serialized wire line (caller includes the trailing
     /// `\n`), chunked to stay under the MTU.
     pub async fn write_line(&self, bytes: &[u8]) -> Result<()> {
+        // Hold the lock for the whole line so its MTU chunks can't interleave
+        // with another concurrent writer's packets.
+        let _guard = self.write_lock.lock().await;
         for chunk in bytes.chunks(WRITE_CHUNK) {
             self.peripheral
                 .write(&self.rx_char, chunk, WriteType::WithoutResponse)

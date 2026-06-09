@@ -216,6 +216,36 @@ pub enum DeviceCommand {
     /// hooks, installs the new one's, persists the choice, and pushes the new
     /// theme to the device. `id` must match a loaded [`crate::agent::AgentProfile`].
     SetAgent { id: String },
+    /// Stream an on-disk animation pack (`<dir>/<state>.spr` files) to the
+    /// connected device's asset store at `/agents/<id>/`. The daemon reads the
+    /// files itself (same machine) and drives the `char_begin`/`file`/`chunk`/
+    /// `file_end`/`char_end` BLE sequence with per-chunk flow control. Unlike the
+    /// other commands this replies with a *stream* of [`PushProgress`] lines
+    /// followed by a terminal [`AdminResponse`]. `set_active` also points the
+    /// active agent's theme at this pack so it displays even when its id differs
+    /// from the active harness.
+    PushPack {
+        id: String,
+        dir: PathBuf,
+        #[serde(default)]
+        set_active: bool,
+    },
+}
+
+/// Interim progress line streamed during a [`DeviceCommand::PushPack`], before
+/// the terminal [`AdminResponse`]. The `kind` field is always `"progress"`, so a
+/// reader can tell it apart from an `AdminResponse` (whose `kind` is
+/// `ok`/`no_device`/`error`) on the same connection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushProgress {
+    /// Always `"progress"`.
+    pub kind: String,
+    /// Bytes pushed + acked so far, across all files.
+    pub done: u64,
+    /// Total bytes in the pack.
+    pub total: u64,
+    /// The state file currently being written (e.g. `"idle.spr"`).
+    pub file: String,
 }
 
 /// Response daemon -> (CLI) for an [`AdminRequest`].

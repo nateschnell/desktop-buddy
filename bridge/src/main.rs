@@ -10,6 +10,10 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use agent_buddy::{ble, client, daemon, hook, ipc, ota, protocol, setup, state};
+#[cfg(feature = "pack")]
+use agent_buddy::packs;
+#[cfg(feature = "pack")]
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "agent-buddy", version, about)]
@@ -75,6 +79,84 @@ enum Command {
         #[arg(long)]
         image: Option<String>,
     },
+    /// Build animation packs from sprite-forge output (and, later, push them to
+    /// the buddy). See `pack build --help`.
+    #[cfg(feature = "pack")]
+    Pack {
+        #[command(subcommand)]
+        cmd: PackCmd,
+    },
+}
+
+/// Subcommands of `agent-buddy pack`.
+#[cfg(feature = "pack")]
+#[derive(Subcommand)]
+enum PackCmd {
+    /// Encode a sprite-forge pack dir into the `.spr` files the device renders.
+    /// Pure host-side: writes `<out>/<id>/<state>.spr`, no device needed.
+    Build {
+        /// sprite-forge pack dir, e.g. `tools/sprite-forge/packs/claude-code`.
+        #[arg(long)]
+        src: PathBuf,
+        /// Pack id (the `/agents/<id>` folder name). Defaults to the src dir name.
+        #[arg(long)]
+        id: Option<String>,
+        /// Output dir holding `<id>/<state>.spr`. Defaults to the config dir's
+        /// `packs/` (where `pack push` looks for it).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Target sprite height in px (aspect-preserved, clamped to 154).
+        #[arg(long, default_value_t = 140)]
+        height: u16,
+        /// Per-frame duration override (ms). Default: per-state from metadata.
+        #[arg(long)]
+        frame_ms: Option<u16>,
+        /// Don't set the loop flag in the `.spr` files.
+        #[arg(long)]
+        no_loop: bool,
+        /// Alpha below this (0–255) maps to the transparent key.
+        #[arg(long, default_value_t = 128)]
+        alpha_threshold: u8,
+    },
+    /// Stream a built pack's `.spr` files to the connected buddy over BLE
+    /// (through the running daemon). Lands them at `/agents/<id>/`.
+    Push {
+        /// On-disk pack dir of `<state>.spr` files. Defaults to the config dir's
+        /// `packs/<id>` (where `pack build` writes).
+        #[arg(long)]
+        src: Option<PathBuf>,
+        /// Pack id (the `/agents/<id>` folder name). Defaults to the src dir name.
+        #[arg(long)]
+        id: Option<String>,
+        /// Also point the active agent's theme at this pack so it displays even
+        /// when its id differs from the active harness.
+        #[arg(long)]
+        set_active: bool,
+    },
+    /// Build a sprite-forge pack and push it to the buddy in one step.
+    Install {
+        /// sprite-forge pack dir, e.g. `tools/sprite-forge/packs/claude-code`.
+        #[arg(long)]
+        src: PathBuf,
+        /// Pack id (the `/agents/<id>` folder name). Defaults to the src dir name.
+        #[arg(long)]
+        id: Option<String>,
+        /// Target sprite height in px (aspect-preserved, clamped to 154).
+        #[arg(long, default_value_t = 140)]
+        height: u16,
+        /// Per-frame duration override (ms). Default: per-state from metadata.
+        #[arg(long)]
+        frame_ms: Option<u16>,
+        /// Don't set the loop flag in the `.spr` files.
+        #[arg(long)]
+        no_loop: bool,
+        /// Alpha below this (0–255) maps to the transparent key.
+        #[arg(long, default_value_t = 128)]
+        alpha_threshold: u8,
+        /// Also point the active agent's theme at this pack so it displays.
+        #[arg(long)]
+        set_active: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -124,6 +206,225 @@ async fn async_main() -> Result<()> {
         Command::Status => status(),
         Command::Wifi { ssid, pass } => wifi(ssid, pass).await,
         Command::Ota { image } => ota(image).await,
+        #[cfg(feature = "pack")]
+        Command::Pack { cmd } => pack(cmd).await,
+    }
+}
+
+/// `agent-buddy pack <sub>`.
+#[cfg(feature = "pack")]
+async fn pack(cmd: PackCmd) -> Result<()> {
+    match cmd {
+        PackCmd::Build {
+            src,
+            id,
+            out,
+            height,
+            frame_ms,
+            no_loop,
+            alpha_threshold,
+        } => pack_build(src, id, out, height, frame_ms, !no_loop, alpha_threshold).map(|_| ()),
+        PackCmd::Push {
+            src,
+            id,
+            set_active,
+        } => pack_push(src, id, set_active).await,
+        PackCmd::Install {
+            src,
+            id,
+            height,
+            frame_ms,
+            no_loop,
+            alpha_threshold,
+            set_active,
+        } => {
+            // Build into the default cache dir, then push that.
+            let (out_pack, id) =
+                pack_build(src, id, None, height, frame_ms, !no_loop, alpha_threshold)?;
+            pack_push(Some(out_pack), Some(id), set_active).await
+        }
+    }
+}
+
+/// Encode a sprite-forge pack dir into `<out>/<id>/<state>.spr`.
+#[cfg(feature = "pack")]
+fn pack_build(
+    src: PathBuf,
+    id: Option<String>,
+    out: Option<PathBuf>,
+    height: u16,
+    frame_ms: Option<u16>,
+    loop_anim: bool,
+    alpha_threshold: u8,
+) -> Result<(PathBuf, String)> {
+    if !src.is_dir() {
+        anyhow::bail!("source pack dir not found: {}", src.display());
+    }
+    let id = id
+        .or_else(|| {
+            src.file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string())
+        })
+        .context("could not derive a pack id from --src; pass --id")?;
+    let out_root = match out {
+        Some(o) => o,
+        None => state::config_dir()?.join("packs"),
+    };
+    let out_pack = out_root.join(&id);
+
+    let opts = packs::BuildOpts {
+        target_h: height,
+        frame_ms,
+        loop_anim,
+        alpha_threshold,
+        transparent: packs::SPR_TRANSPARENT,
+    };
+    let reports = packs::build_pack(&src, &out_pack, &opts)?;
+
+    println!("Built pack '{id}' → {}", out_pack.display());
+    let mut total = 0usize;
+    for r in &reports {
+        total += r.bytes;
+        println!(
+            "  {:<10} {:>2} frames  {:>3}×{:<3}  {:>4} ms  {:>6.1} KB",
+            r.state,
+            r.frames,
+            r.w,
+            r.h,
+            r.frame_ms,
+            r.bytes as f64 / 1024.0,
+        );
+    }
+    println!("  {} states, {:.1} KB total", reports.len(), total as f64 / 1024.0);
+    // The FNK0104's LittleFS budget is ~3.375 MB; warn well before that.
+    const BUDGET_WARN: usize = 2 * 1024 * 1024;
+    if total > BUDGET_WARN {
+        println!(
+            "  ⚠ {:.1} MB is large for the device filesystem (~3.4 MB) — consider \
+             a smaller --height or fewer frames.",
+            total as f64 / (1024.0 * 1024.0)
+        );
+    }
+    println!("Push it with:  agent-buddy pack push --src {}", out_pack.display());
+    Ok((out_pack, id))
+}
+
+/// Stream a built pack's `.spr` files to the connected buddy via the daemon.
+#[cfg(feature = "pack")]
+async fn pack_push(src: Option<PathBuf>, id: Option<String>, set_active: bool) -> Result<()> {
+    use ipc::{AdminRequest, AdminResponse, DeviceCommand};
+
+    // Resolve (dir, id): an explicit --src wins (id defaults to its name); else
+    // --id points at the built pack under the config dir.
+    let (dir, id) = match (src, id) {
+        (Some(src), id) => {
+            let id = id
+                .or_else(|| src.file_name().and_then(|n| n.to_str()).map(String::from))
+                .context("could not derive a pack id from --src; pass --id")?;
+            (src, id)
+        }
+        (None, Some(id)) => (state::config_dir()?.join("packs").join(&id), id),
+        (None, None) => {
+            anyhow::bail!("pass --src <pack dir> or --id <pack-id> (a previously built pack)")
+        }
+    };
+    if !dir.is_dir() {
+        anyhow::bail!("pack dir not found: {} (run `agent-buddy pack build` first)", dir.display());
+    }
+    // Canonicalize: the daemon runs from a different cwd and reads these files.
+    let dir = std::fs::canonicalize(&dir).with_context(|| format!("resolving {}", dir.display()))?;
+    let has_spr = std::fs::read_dir(&dir)?.flatten().any(|e| {
+        e.path().extension().and_then(|x| x.to_str()) == Some("spr")
+    });
+    if !has_spr {
+        anyhow::bail!("no .spr files in {} — run `agent-buddy pack build` first", dir.display());
+    }
+
+    let ep = ipc::read_endpoint().map_err(|_| {
+        anyhow::anyhow!("no daemon is running — pushing a pack needs the daemon's BLE link")
+    })?;
+    println!("Pushing pack '{id}' to the buddy…");
+    let last = std::sync::atomic::AtomicU8::new(255);
+    let resp = send_admin_streaming(
+        &ep,
+        &AdminRequest {
+            token: ep.token.clone(),
+            command: DeviceCommand::PushPack {
+                id: id.clone(),
+                dir,
+                set_active,
+            },
+        },
+        |done, total, _file| {
+            let pct = (done.saturating_mul(100) / total.max(1)) as u8;
+            let prev = last.swap(pct, std::sync::atomic::Ordering::Relaxed);
+            if pct == 100 || prev == 255 || pct / 5 != prev / 5 {
+                eprint!("\r  {pct:3}%");
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+            }
+        },
+    )
+    .await?;
+    eprintln!();
+    match resp {
+        AdminResponse::Ok { .. } => {
+            println!("✓ pushed pack '{id}' to /agents/{id} on the buddy.");
+            if !set_active {
+                println!(
+                    "  If '{id}' isn't the active agent's pack, it won't display yet — \
+                     re-run with --set-active or switch agents."
+                );
+            }
+            Ok(())
+        }
+        AdminResponse::NoDevice => {
+            anyhow::bail!("the daemon is running but no buddy is connected — wake it and retry")
+        }
+        AdminResponse::Error { message } => anyhow::bail!("push failed: {message}"),
+    }
+}
+
+/// Like [`send_admin`], but for the streaming `PushPack` reply: relays each
+/// `{"kind":"progress",...}` line to `on_progress` and returns the terminal
+/// [`AdminResponse`]. A long per-line timeout backstops the daemon-side per-step
+/// timeouts (which surface a terminal error quickly on a real stall).
+#[cfg(feature = "pack")]
+async fn send_admin_streaming(
+    ep: &ipc::Endpoint,
+    req: &ipc::AdminRequest,
+    mut on_progress: impl FnMut(u64, u64, &str),
+) -> Result<ipc::AdminResponse> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", ep.port)).await?;
+    let (read_half, mut write_half) = stream.into_split();
+    let mut bytes = serde_json::to_vec(req)?;
+    bytes.push(b'\n');
+    write_half.write_all(&bytes).await?;
+    write_half.flush().await?;
+
+    let mut reader = BufReader::new(read_half);
+    loop {
+        let mut line = String::new();
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            reader.read_line(&mut line),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("the daemon went silent during the push"))??;
+        if n == 0 {
+            anyhow::bail!("the daemon closed the connection mid-push");
+        }
+        let trimmed = line.trim();
+        // A progress line has done/total/file; a terminal AdminResponse doesn't,
+        // so it fails this parse and falls through.
+        if let Ok(p) = serde_json::from_str::<ipc::PushProgress>(trimmed) {
+            if p.kind == "progress" {
+                on_progress(p.done, p.total, &p.file);
+                continue;
+            }
+        }
+        return Ok(serde_json::from_str(trimmed)?);
     }
 }
 

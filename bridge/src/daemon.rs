@@ -9,7 +9,8 @@ use crate::agent::{self, AgentProfile};
 use crate::ble::BleLink;
 use crate::ipc::{
     AdminRequest, AdminResponse, DeviceCommand, Endpoint, FirmwareLatest, HookEvent, HookRequest,
-    HookResponse, Query, QueryRequest, QueryResponse, StatusReport, UpdateStatus, ENDPOINT_FILE,
+    HookResponse, PushProgress, Query, QueryRequest, QueryResponse, StatusReport, UpdateStatus,
+    ENDPOINT_FILE,
 };
 use crate::protocol::{
     self, Decision, Heartbeat, Inbound, OutboundCmd, PromptPayload, TimeSync, MAX_LINE_BYTES,
@@ -186,6 +187,27 @@ enum Event {
         app: UpdateStatus,
         firmware: HashMap<String, FirmwareLatest>,
     },
+    /// A CLI client asked to stream an animation pack to the device. Unlike
+    /// [`Event::DeviceCommand`] the reply is a stream, so it carries an mpsc
+    /// sender of [`PushUpdate`]s instead of a oneshot. The owner loop spawns a
+    /// task to drive the BLE sequence (so awaiting acks doesn't block the loop)
+    /// and forwards the device's chunk acks into the task via `pending_push`.
+    PushPack {
+        id: String,
+        dir: std::path::PathBuf,
+        set_active: bool,
+        updates: mpsc::Sender<PushUpdate>,
+    },
+    /// The spawned push task finished; the owner loop clears `pending_push` and,
+    /// when `set_active` names a pack, points the active agent's theme at it.
+    PushFinished { set_active: Option<String> },
+}
+
+/// What a push task streams back to the waiting CLI connection: zero or more
+/// progress ticks, then exactly one terminal response.
+pub enum PushUpdate {
+    Progress { done: u64, total: u64, file: String },
+    Done(AdminResponse),
 }
 
 /// A Wi-Fi provisioning request whose IPC responder is parked until the device
@@ -351,6 +373,12 @@ pub async fn run(mock: Option<MockPolicy>) -> Result<()> {
     // until the device acks storing the creds (and, briefly, joining). At most
     // one at a time — the latest request supersedes any earlier unresolved one.
     let mut pending_wifi: Option<PendingWifi> = None;
+    // An in-flight animation-pack push. Holds the ack sink the push task drains;
+    // the owner loop forwards the device's char/file/chunk acks into it. At most
+    // one push at a time (a second is rejected while this is_some()). Cleared by
+    // the task's `PushFinished`, or on disconnect (which drops the sink → the
+    // task's recv() ends → it aborts and reports the failure to its CLI).
+    let mut pending_push: Option<mpsc::Sender<protocol::Ack>> = None;
     // The last classified reason a connect attempt failed, surfaced in status so
     // the UI can guide the user. Cleared on a successful connect.
     let mut last_connect_error: Option<String> = None;
@@ -424,6 +452,9 @@ pub async fn run(mock: Option<MockPolicy>) -> Result<()> {
                 last_net = None;
                 last_fw = None;
                 last_board = None;
+                // Drop any in-flight push sink: the task's recv() ends and it
+                // reports the disconnect to its CLI.
+                pending_push = None;
                 drop_link(&mut link, &mut prompts, &mut state);
             }
             Event::Keepalive => {
@@ -459,6 +490,7 @@ pub async fn run(mock: Option<MockPolicy>) -> Result<()> {
                     last_net = None;
                     last_fw = None;
                     last_board = None;
+                    pending_push = None;
                     drop_link(&mut link, &mut prompts, &mut state);
                 }
                 push_heartbeat(&link, &state, prompts.front()).await;
@@ -472,9 +504,16 @@ pub async fn run(mock: Option<MockPolicy>) -> Result<()> {
                     &mut last_fw,
                     &mut last_board,
                     &mut pending_wifi,
+                    &mut pending_push,
                 );
-                // A decision may have cleared the front prompt — refresh.
-                push_heartbeat(&link, &state, prompts.front()).await;
+                // A decision may have cleared the front prompt — refresh. But
+                // skip during a pack push: each chunk ack arrives as a DeviceLine,
+                // and a heartbeat write per ack would both spam the link and
+                // contend with the push task's writes (liveness is still kept by
+                // the periodic Keepalive heartbeat).
+                if pending_push.is_none() {
+                    push_heartbeat(&link, &state, prompts.front()).await;
+                }
             }
             Event::PromptTimeout(id) => {
                 if let Some(pos) = prompts.iter().position(|p| p.id == id) {
@@ -600,6 +639,14 @@ pub async fn run(mock: Option<MockPolicy>) -> Result<()> {
                             }
                         }
                     }
+                    // A pack push streams its reply, so serve_hook_conn routes it
+                    // to Event::PushPack before it ever becomes a DeviceCommand —
+                    // this arm is just exhaustiveness insurance.
+                    DeviceCommand::PushPack { .. } => {
+                        let _ = responder.send(AdminResponse::Error {
+                            message: "internal: pack push reached the oneshot path".into(),
+                        });
+                    }
                 }
             }
             Event::UpdateInfo { app, firmware } => {
@@ -608,6 +655,68 @@ pub async fn run(mock: Option<MockPolicy>) -> Result<()> {
                 }
                 latest_update = Some(app);
                 firmware_latest = firmware;
+            }
+            Event::PushPack {
+                id,
+                dir,
+                set_active,
+                updates,
+            } => {
+                // Spawn the push as its own task so awaiting per-chunk acks never
+                // blocks this loop (which dispatches those very acks). The task
+                // drains `pending_push`, fed by handle_device_line.
+                #[cfg(feature = "pack")]
+                {
+                    let Some(l) = link.clone() else {
+                        let _ = updates.send(PushUpdate::Done(AdminResponse::NoDevice)).await;
+                        continue;
+                    };
+                    if pending_push.is_some() {
+                        let _ = updates
+                            .send(PushUpdate::Done(AdminResponse::Error {
+                                message: "a pack push is already in progress".into(),
+                            }))
+                            .await;
+                        continue;
+                    }
+                    let (ack_tx, ack_rx) = mpsc::channel::<protocol::Ack>(8);
+                    pending_push = Some(ack_tx);
+                    tokio::spawn(push_pack_task(
+                        l,
+                        id,
+                        dir,
+                        set_active,
+                        ack_rx,
+                        updates,
+                        ev_tx.clone(),
+                    ));
+                }
+                #[cfg(not(feature = "pack"))]
+                {
+                    let _ = (id, dir, set_active);
+                    let _ = updates
+                        .send(PushUpdate::Done(AdminResponse::Error {
+                            message: "this build has no animation-pack support".into(),
+                        }))
+                        .await;
+                }
+            }
+            Event::PushFinished { set_active } => {
+                pending_push = None;
+                // On `--set-active`, point the active agent's theme at the pushed
+                // pack so it displays even when its id differs from the active
+                // harness. (When the ids already match, the firmware auto-loaded
+                // it on char_end — this re-push is then harmlessly idempotent.)
+                if let (Some(pack_id), Some(l)) = (set_active, link.clone()) {
+                    if let Some(p) = profiles.get(&config.active_agent) {
+                        let cmd = theme_cmd_with_pack(p, &pack_id);
+                        match tokio::time::timeout(Duration::from_secs(2), l.send(&cmd)).await {
+                            Ok(Err(e)) => warn!("theme pack-override failed: {e}"),
+                            Err(_) => warn!("theme pack-override timed out"),
+                            Ok(Ok(())) => info!("pointed theme at pushed pack '{pack_id}'"),
+                        }
+                    }
+                }
             }
             Event::Query(query, responder) => {
                 // A recheck nudge re-arms the checker before we build the reply;
@@ -765,6 +874,38 @@ fn theme_cmd(p: &AgentProfile) -> OutboundCmd {
         panels: p.panel_bits(),
         caps: p.capabilities.bits(),
         pack: Some(p.pack().to_string()),
+    }
+}
+
+/// The active agent's theme, but with its `pack` field overridden — used after a
+/// `pack push --set-active` so a pack whose id differs from the active harness
+/// still displays (the firmware loads `theme().pack`).
+fn theme_cmd_with_pack(p: &AgentProfile, pack: &str) -> OutboundCmd {
+    match theme_cmd(p) {
+        OutboundCmd::Theme {
+            id,
+            label,
+            pal,
+            hot,
+            panel,
+            sel,
+            ok,
+            panels,
+            caps,
+            ..
+        } => OutboundCmd::Theme {
+            id,
+            label,
+            pal,
+            hot,
+            panel,
+            sel,
+            ok,
+            panels,
+            caps,
+            pack: Some(pack.to_string()),
+        },
+        other => other,
     }
 }
 
@@ -951,8 +1092,9 @@ fn drop_link(link: &mut Option<Link>, prompts: &mut VecDeque<Pending>, state: &m
 }
 
 /// Parse one device line; resolve a matching pending prompt on a decision,
-/// correlate a Wi-Fi store ack/join with a parked provisioning request, and
-/// record any Wi-Fi the device announces joining (for the status UI / OTA).
+/// correlate a Wi-Fi store ack/join with a parked provisioning request, route a
+/// pack push's transfer acks, and record any Wi-Fi the device announces joining.
+#[allow(clippy::too_many_arguments)] // cohesive owner-loop state, not a config bag
 fn handle_device_line(
     line: &str,
     prompts: &mut VecDeque<Pending>,
@@ -961,6 +1103,7 @@ fn handle_device_line(
     last_fw: &mut Option<String>,
     last_board: &mut Option<String>,
     pending_wifi: &mut Option<PendingWifi>,
+    pending_push: &mut Option<mpsc::Sender<protocol::Ack>>,
 ) {
     match protocol::parse_inbound(line) {
         Ok(Inbound::Permission(d)) => {
@@ -979,7 +1122,23 @@ fn handle_device_line(
             }
         }
         Ok(Inbound::Ack(a)) => {
-            if a.ack == "wifi" {
+            // An in-flight pack push owns the char/file transfer acks — forward
+            // them to its task (which is awaiting them for flow control) instead
+            // of the generic logging below. try_send can't block this loop; a
+            // closed channel means the task ended, so drop the stale sink.
+            let is_push_ack = matches!(
+                a.ack.as_str(),
+                "char_begin" | "file" | "chunk" | "file_end" | "char_end"
+            );
+            if is_push_ack && pending_push.is_some() {
+                let failed = pending_push
+                    .as_ref()
+                    .map(|tx| tx.try_send(a.clone()).is_err())
+                    .unwrap_or(true);
+                if failed {
+                    *pending_push = None;
+                }
+            } else if a.ack == "wifi" {
                 // Correlate with the parked provisioning request. The firmware's
                 // ok reflects *verified NVS persistence* (see firmware xfer.h /
                 // net.cpp), so only ok:true means the creds will survive a reboot.
@@ -1061,6 +1220,145 @@ fn handle_device_line(
         }
         Err(e) => debug!("unparseable device line {line:?}: {e}"),
     }
+}
+
+/// How long to wait for a control ack (`char_begin`/`file`/`file_end`/
+/// `char_end`). Generous: a `file` open or `char_begin` mkdir touches LittleFS.
+#[cfg(feature = "pack")]
+const PUSH_CTRL_ACK_TIMEOUT: Duration = Duration::from_secs(8);
+/// How long to wait for a single `chunk` ack. Usually milliseconds, but a
+/// LittleFS flash-erase between blocks can stall a write briefly.
+#[cfg(feature = "pack")]
+const PUSH_CHUNK_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Drive the full `char_begin → (file → chunk* → file_end)* → char_end` push,
+/// then report completion to the CLI stream and clear the owner loop's
+/// `pending_push`. Runs as its own task: it `await`s acks (fed by the owner loop
+/// via `ack_rx`) without ever blocking that loop.
+#[cfg(feature = "pack")]
+async fn push_pack_task(
+    link: Link,
+    id: String,
+    dir: std::path::PathBuf,
+    set_active: bool,
+    mut ack_rx: mpsc::Receiver<protocol::Ack>,
+    updates: mpsc::Sender<PushUpdate>,
+    ev_tx: mpsc::Sender<Event>,
+) {
+    let (resp, set_active_id) = match run_push(&link, &id, &dir, &mut ack_rx, &updates).await {
+        Ok(()) => (
+            AdminResponse::Ok { joined: None },
+            if set_active { Some(id) } else { None },
+        ),
+        Err(e) => (AdminResponse::Error { message: e.to_string() }, None),
+    };
+    // Tell the owner loop first (clears pending_push + applies set_active), then
+    // resolve the CLI's stream.
+    let _ = ev_tx
+        .send(Event::PushFinished {
+            set_active: set_active_id,
+        })
+        .await;
+    let _ = updates.send(PushUpdate::Done(resp)).await;
+}
+
+/// The push protocol itself. Errors carry a user-facing "retry the push" hint.
+#[cfg(feature = "pack")]
+async fn run_push(
+    link: &Link,
+    id: &str,
+    dir: &std::path::Path,
+    ack_rx: &mut mpsc::Receiver<protocol::Ack>,
+    updates: &mpsc::Sender<PushUpdate>,
+) -> Result<()> {
+    use base64::Engine;
+    // Collect the state files present, in PersonaState order.
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    for state in crate::packs::STATE_NAMES {
+        let p = dir.join(format!("{state}.spr"));
+        if let Ok(bytes) = tokio::fs::read(&p).await {
+            files.push((format!("{state}.spr"), bytes));
+        }
+    }
+    if files.is_empty() {
+        anyhow::bail!("no <state>.spr files in {} — build the pack first", dir.display());
+    }
+    let total: u64 = files.iter().map(|(_, b)| b.len() as u64).sum();
+
+    link.send(&OutboundCmd::CharBegin {
+        name: id.to_string(),
+        total,
+    })
+    .await
+    .context("sending char_begin")?;
+    await_push_ack(ack_rx, "char_begin", PUSH_CTRL_ACK_TIMEOUT).await?;
+
+    let mut done: u64 = 0;
+    for (path, bytes) in &files {
+        link.send(&OutboundCmd::File {
+            path: path.clone(),
+            size: bytes.len() as u64,
+        })
+        .await
+        .with_context(|| format!("sending file header for {path}"))?;
+        await_push_ack(ack_rx, "file", PUSH_CTRL_ACK_TIMEOUT)
+            .await
+            .with_context(|| format!("opening {path} on the buddy"))?;
+
+        // Chunk at the device's decode-buffer cap (mirrors packs::spr_to_chunks,
+        // tracking each slice's length for progress).
+        for slice in bytes.chunks(crate::packs::CHUNK_BYTES) {
+            let d = base64::engine::general_purpose::STANDARD.encode(slice);
+            link.send(&OutboundCmd::Chunk { d })
+                .await
+                .with_context(|| format!("sending a chunk of {path}"))?;
+            await_push_ack(ack_rx, "chunk", PUSH_CHUNK_ACK_TIMEOUT)
+                .await
+                .with_context(|| format!("writing {path}"))?;
+            done += slice.len() as u64;
+            let _ = updates
+                .send(PushUpdate::Progress {
+                    done,
+                    total,
+                    file: path.clone(),
+                })
+                .await;
+        }
+
+        link.send(&OutboundCmd::FileEnd)
+            .await
+            .with_context(|| format!("finishing {path}"))?;
+        await_push_ack(ack_rx, "file_end", PUSH_CTRL_ACK_TIMEOUT)
+            .await
+            .with_context(|| format!("closing {path} on the buddy"))?;
+    }
+
+    link.send(&OutboundCmd::CharEnd).await.context("sending char_end")?;
+    await_push_ack(ack_rx, "char_end", PUSH_CTRL_ACK_TIMEOUT).await?;
+    Ok(())
+}
+
+/// Await the next push ack, asserting it's the one expected and `ok`.
+#[cfg(feature = "pack")]
+async fn await_push_ack(
+    ack_rx: &mut mpsc::Receiver<protocol::Ack>,
+    expect: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let ack = tokio::time::timeout(timeout, ack_rx.recv())
+        .await
+        .map_err(|_| anyhow::anyhow!("the buddy stopped acking ({expect}) — retry the push"))?
+        .ok_or_else(|| anyhow::anyhow!("the buddy disconnected mid-push — retry"))?;
+    if ack.ack != expect {
+        anyhow::bail!("protocol desync: got ack '{}' while awaiting '{expect}'", ack.ack);
+    }
+    if !ack.ok {
+        anyhow::bail!(
+            "the buddy rejected {expect}: {}",
+            ack.error.unwrap_or_else(|| "no reason given".into())
+        );
+    }
+    Ok(())
 }
 
 /// A parked Wi-Fi request hit its phase deadline with no further device word.
@@ -1517,7 +1815,26 @@ async fn serve_hook_conn(
     }
 
     if let Ok(req) = serde_json::from_str::<AdminRequest>(trimmed) {
-        let resp = if req.token == token {
+        if req.token != token {
+            return write_response(
+                &mut write_half,
+                &AdminResponse::Error {
+                    message: "bad token".into(),
+                },
+            )
+            .await;
+        }
+        // A pack push streams progress, so it gets its own multi-line path; every
+        // other admin command is a single parked-oneshot reply.
+        if let DeviceCommand::PushPack {
+            id,
+            dir,
+            set_active,
+        } = req.command
+        {
+            return stream_push(&mut write_half, ev_tx, id, dir, set_active).await;
+        }
+        let resp = {
             let (tx, rx) = oneshot::channel();
             if ev_tx
                 .send(Event::DeviceCommand(req.command, tx))
@@ -1531,10 +1848,6 @@ async fn serve_hook_conn(
                 rx.await.unwrap_or(AdminResponse::Error {
                     message: "daemon dropped the request".into(),
                 })
-            }
-        } else {
-            AdminResponse::Error {
-                message: "bad token".into(),
             }
         };
         return write_response(&mut write_half, &resp).await;
@@ -1564,6 +1877,64 @@ async fn serve_hook_conn(
         &mut write_half,
         &HookResponse::Error {
             message: "unrecognized request".into(),
+        },
+    )
+    .await
+}
+
+/// Drive a `PushPack` over one IPC connection: hand the owner loop an mpsc
+/// sender, then relay each [`PushUpdate`] as a JSON line — `PushProgress` ticks
+/// followed by the terminal [`AdminResponse`].
+async fn stream_push(
+    write_half: &mut (impl AsyncWriteExt + Unpin),
+    ev_tx: &mpsc::Sender<Event>,
+    id: String,
+    dir: std::path::PathBuf,
+    set_active: bool,
+) -> Result<()> {
+    let (tx, mut rx) = mpsc::channel::<PushUpdate>(16);
+    if ev_tx
+        .send(Event::PushPack {
+            id,
+            dir,
+            set_active,
+            updates: tx,
+        })
+        .await
+        .is_err()
+    {
+        return write_response(
+            write_half,
+            &AdminResponse::Error {
+                message: "daemon shutting down".into(),
+            },
+        )
+        .await;
+    }
+    while let Some(u) = rx.recv().await {
+        match u {
+            PushUpdate::Progress { done, total, file } => {
+                write_response(
+                    write_half,
+                    &PushProgress {
+                        kind: "progress".into(),
+                        done,
+                        total,
+                        file,
+                    },
+                )
+                .await?;
+            }
+            PushUpdate::Done(resp) => {
+                return write_response(write_half, &resp).await;
+            }
+        }
+    }
+    // The task dropped its sender without a terminal Done (shouldn't happen).
+    write_response(
+        write_half,
+        &AdminResponse::Error {
+            message: "the push ended unexpectedly".into(),
         },
     )
     .await
@@ -2111,6 +2482,52 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "pack")]
+    fn ack(name: &str, ok: bool) -> protocol::Ack {
+        protocol::Ack {
+            ack: name.into(),
+            ok,
+            n: 0,
+            error: if ok { None } else { Some("nope".into()) },
+        }
+    }
+
+    #[cfg(feature = "pack")]
+    #[tokio::test]
+    async fn await_push_ack_accepts_expected_ok() {
+        let (tx, mut rx) = mpsc::channel::<protocol::Ack>(4);
+        tx.send(ack("chunk", true)).await.unwrap();
+        assert!(await_push_ack(&mut rx, "chunk", Duration::from_secs(1)).await.is_ok());
+    }
+
+    #[cfg(feature = "pack")]
+    #[tokio::test]
+    async fn await_push_ack_rejects_nack_wrong_name_and_disconnect() {
+        // A nack (ok:false) for the expected step is an error.
+        let (tx, mut rx) = mpsc::channel::<protocol::Ack>(4);
+        tx.send(ack("file", false)).await.unwrap();
+        assert!(await_push_ack(&mut rx, "file", Duration::from_secs(1)).await.is_err());
+
+        // An ack for a *different* step is a protocol desync error.
+        let (tx, mut rx) = mpsc::channel::<protocol::Ack>(4);
+        tx.send(ack("char_end", true)).await.unwrap();
+        assert!(await_push_ack(&mut rx, "chunk", Duration::from_secs(1)).await.is_err());
+
+        // A closed channel (owner loop dropped the sink on disconnect) is an error.
+        let (tx, mut rx) = mpsc::channel::<protocol::Ack>(4);
+        drop(tx);
+        assert!(await_push_ack(&mut rx, "chunk", Duration::from_secs(1)).await.is_err());
+    }
+
+    #[cfg(feature = "pack")]
+    #[tokio::test]
+    async fn await_push_ack_times_out_when_silent() {
+        let (_tx, mut rx) = mpsc::channel::<protocol::Ack>(4);
+        // Keep _tx alive (channel open) but send nothing → must hit the timeout.
+        let r = await_push_ack(&mut rx, "chunk", Duration::from_millis(50)).await;
+        assert!(r.is_err());
+    }
 
     #[test]
     fn truncate_is_byte_bounded_with_ellipsis_inside_budget() {
