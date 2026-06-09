@@ -188,6 +188,9 @@ jobs:
           mkdir -p bin
           cp target/${{ matrix.target }}/release/agent-buddy bin/
           cp target/${{ matrix.target }}/release/agent-buddy-app bin/
+          # The floating desktop buddy — a sibling the app spawns (it's its own
+          # process; egui can't make a child viewport transparent).
+          cp target/${{ matrix.target }}/release/agent-buddy-widget bin/
 
       - name: Stage raw binaries (windows)
         if: matrix.ext == 'zip'
@@ -196,6 +199,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path bin | Out-Null
           Copy-Item target/${{ matrix.target }}/release/agent-buddy.exe bin/
           Copy-Item target/${{ matrix.target }}/release/agent-buddy-app.exe bin/
+          Copy-Item target/${{ matrix.target }}/release/agent-buddy-widget.exe bin/
 
       - name: Upload raw binaries
         uses: actions/upload-artifact@v5
@@ -230,7 +234,7 @@ jobs:
       - name: Lipo to universal binaries
         run: |
           mkdir -p universal
-          for b in agent-buddy agent-buddy-app; do
+          for b in agent-buddy agent-buddy-app agent-buddy-widget; do
             lipo -create -output "universal/$b" "arm64/$b" "x86_64/$b"
             chmod +x "universal/$b"
           done
@@ -386,7 +390,7 @@ jobs:
           chmod +x /usr/local/bin/appimagetool
       - name: Build AppImage
         run: |
-          chmod +x bin/agent-buddy bin/agent-buddy-app
+          chmod +x bin/agent-buddy bin/agent-buddy-app bin/agent-buddy-widget
           mkdir -p out
           bash packaging/linux/make-appimage.sh \
             --bin-dir bin --fw-dir fw --out out \
