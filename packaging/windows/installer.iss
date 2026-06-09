@@ -43,9 +43,10 @@ ArchitecturesInstallIn64BitMode=x64compatible
 [Files]
 Source: "{#StageDir}\agent-buddy-app.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\agent-buddy.exe";     DestDir: "{app}"; Flags: ignoreversion
-; The floating desktop buddy — a sibling process the app spawns. Optional
-; (skipped if a build didn't produce it); the app degrades gracefully.
-Source: "{#StageDir}\agent-buddy-widget.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+; The floating desktop buddy — a sibling process the app spawns. REQUIRED (no
+; skipifsourcedoesntexist): if the staging step ever drops it, the installer
+; build fails loudly rather than silently shipping without the buddy.
+Source: "{#StageDir}\agent-buddy-widget.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; Every board's firmware image + version (and the legacy firmware.* alias) so the
 ; app's one-click OTA has an image for whichever board connects.
 Source: "{#StageDir}\firmware*.bin";        DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist

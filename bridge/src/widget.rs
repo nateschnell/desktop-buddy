@@ -320,13 +320,17 @@ impl BuddyWidget {
         let (Some(outer), Some(monitor)) = (outer, monitor) else {
             return;
         };
-        // Which edge (if any) is the window pinned to?
-        let near = 2.0;
-        self.docked = if outer.min.x <= near {
+        // Which edge (if any) has the buddy been *shoved past*? Peek only engages
+        // when part of the window is already hanging off the screen — a deliberate
+        // drag. Resting flush in a corner (a window's edge exactly at the screen
+        // boundary, e.g. bottom-right) is a normal placement and must stay fully
+        // visible, not auto-hide.
+        let off = PEEK_SLIVER;
+        self.docked = if outer.min.x <= -off {
             Some(Edge::Left)
-        } else if outer.max.x >= monitor.x - near {
+        } else if outer.max.x >= monitor.x + off {
             Some(Edge::Right)
-        } else if outer.min.y <= near {
+        } else if outer.min.y <= -off {
             Some(Edge::Top)
         } else {
             None

@@ -37,11 +37,43 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$BIN_DIR" ] && [ -n "$OUT" ] || { echo "need --bin-dir and --out" >&2; exit 2; }
 
-GUI="$BIN_DIR/agent-buddy-app"
+# Completeness guard. The desktop bundle must carry EVERY binary the crate
+# declares — the daemon plus each GUI bin (agent-buddy-app, agent-buddy-widget,
+# …). We derive that list from bridge/Cargo.toml's [[bin]] entries (single source
+# of truth) and hard-fail if any is absent from --bin-dir, so a packaging or
+# staging step that drops a binary breaks the build LOUDLY instead of silently
+# shipping an incomplete app. This is the guard that would have caught the
+# v0.2.2 release shipping without agent-buddy-widget.
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+CARGO="$ROOT/bridge/Cargo.toml"
+expected_bins() {
+  if [ -f "$CARGO" ]; then
+    awk '
+      /^\[\[bin\]\]/ { inbin=1; next }
+      /^\[/          { inbin=0 }
+      inbin && /^[[:space:]]*name[[:space:]]*=/ {
+        l=$0; sub(/.*=[[:space:]]*"/, "", l); sub(/".*/, "", l); print l
+      }
+    ' "$CARGO"
+  else
+    # Cargo.toml not locatable — fall back to the known set so the guard still
+    # has teeth. Keep in sync with bridge/Cargo.toml [[bin]] entries.
+    printf '%s\n' agent-buddy agent-buddy-app agent-buddy-widget
+  fi
+}
+EXPECTED_BINS="$(expected_bins)"
+[ -n "$EXPECTED_BINS" ] || { echo "could not determine expected binaries from $CARGO" >&2; exit 1; }
+missing=""
+for b in $EXPECTED_BINS; do
+  [ -f "$BIN_DIR/$b" ] || missing="$missing $b"
+done
+if [ -n "$missing" ]; then
+  echo "::error::desktop bundle is missing binaries from --bin-dir ($BIN_DIR):$missing" >&2
+  echo "  expected (from $CARGO):" $EXPECTED_BINS >&2
+  echo "  present:" $(cd "$BIN_DIR" && ls 2>/dev/null) >&2
+  exit 1
+fi
 DAEMON="$BIN_DIR/agent-buddy"
-WIDGET="$BIN_DIR/agent-buddy-widget"
-[ -f "$GUI" ]    || { echo "missing GUI binary: $GUI" >&2; exit 1; }
-[ -f "$DAEMON" ] || { echo "missing daemon binary: $DAEMON" >&2; exit 1; }
 
 # CFBundleVersion wants a dotted number; strip the leading v and any -gHASH tail
 # from `git describe` (e.g. v0.1.0-2-g86cb615 -> 0.1.0). Keep $VERSION verbatim
@@ -55,14 +87,13 @@ echo "==> assembling $APP (version $VERSION)"
 rm -rf "$APP"
 mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources"
 
-install -m 0755 "$GUI"    "$CONTENTS/MacOS/agent-buddy-app"
-install -m 0755 "$DAEMON" "$CONTENTS/MacOS/agent-buddy"
-# The floating desktop buddy is a sibling binary the app spawns (it must be its
-# own process — a transparent main viewport). Optional so a build without it
-# still bundles; the app falls back gracefully if it's absent.
-if [ -f "$WIDGET" ]; then
-  install -m 0755 "$WIDGET" "$CONTENTS/MacOS/agent-buddy-widget"
-fi
+# Install every declared binary as a sibling in Contents/MacOS/ (the guard above
+# already verified they're all present). agent-buddy-app is the bundle's main
+# executable (CFBundleExecutable); agent-buddy is the daemon; agent-buddy-widget
+# is the floating desktop buddy the app spawns.
+for b in $EXPECTED_BINS; do
+  install -m 0755 "$BIN_DIR/$b" "$CONTENTS/MacOS/$b"
+done
 
 # Bring along every firmware image + version so the app's one-click OTA has an
 # image to flash for whichever board connects (see ota::bundled_firmware_path).
@@ -127,12 +158,12 @@ IDENTITY="${MACOS_SIGN_IDENTITY:--}"
 echo "==> codesigning (identity: $IDENTITY)"
 if [ "$IDENTITY" != "-" ]; then
   HARDENED=(--options runtime --timestamp)
-  # Inner Mach-O binaries first (the sibling daemon), then the bundle itself —
-  # signing the bundle covers its main executable (agent-buddy-app).
-  codesign --force "${HARDENED[@]}" --sign "$IDENTITY" \
-    "$CONTENTS/MacOS/agent-buddy"
-  [ -f "$CONTENTS/MacOS/agent-buddy-widget" ] && codesign --force "${HARDENED[@]}" --sign "$IDENTITY" \
-    "$CONTENTS/MacOS/agent-buddy-widget"
+  # Inner Mach-O binaries first (every sibling except the main executable), then
+  # the bundle itself — signing the bundle covers its main exe (agent-buddy-app).
+  for b in $EXPECTED_BINS; do
+    [ "$b" = "agent-buddy-app" ] && continue
+    codesign --force "${HARDENED[@]}" --sign "$IDENTITY" "$CONTENTS/MacOS/$b"
+  done
   codesign --force "${HARDENED[@]}" --sign "$IDENTITY" \
     --identifier com.nateschnell.agent-buddy-app "$APP"
   codesign --verify --strict --verbose=2 "$APP"

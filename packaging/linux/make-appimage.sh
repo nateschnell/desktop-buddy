@@ -27,18 +27,40 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$BIN_DIR" ] && [ -n "$OUT" ] || { echo "need --bin-dir and --out" >&2; exit 2; }
 
-GUI="$BIN_DIR/agent-buddy-app"
-DAEMON="$BIN_DIR/agent-buddy"
-WIDGET="$BIN_DIR/agent-buddy-widget"
-[ -f "$GUI" ]    || { echo "missing GUI binary: $GUI" >&2; exit 1; }
-[ -f "$DAEMON" ] || { echo "missing daemon binary: $DAEMON" >&2; exit 1; }
+# Completeness guard — the AppImage must carry EVERY binary the crate declares
+# (daemon + each GUI bin). Derived from bridge/Cargo.toml's [[bin]] entries so it
+# auto-covers new binaries and hard-fails (rather than silently shipping an
+# incomplete bundle) if a staging step drops one. See make-app.sh for the
+# rationale (the v0.2.2 widget-omission this prevents).
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+CARGO="$ROOT/bridge/Cargo.toml"
+if [ -f "$CARGO" ]; then
+  EXPECTED_BINS="$(awk '
+    /^\[\[bin\]\]/ { inbin=1; next }
+    /^\[/          { inbin=0 }
+    inbin && /^[[:space:]]*name[[:space:]]*=/ { l=$0; sub(/.*=[[:space:]]*"/,"",l); sub(/".*/,"",l); print l }
+  ' "$CARGO")"
+else
+  EXPECTED_BINS="agent-buddy agent-buddy-app agent-buddy-widget"
+fi
+[ -n "$EXPECTED_BINS" ] || { echo "could not determine expected binaries from $CARGO" >&2; exit 1; }
+missing=""
+for b in $EXPECTED_BINS; do
+  [ -f "$BIN_DIR/$b" ] || missing="$missing $b"
+done
+if [ -n "$missing" ]; then
+  echo "::error::AppImage is missing binaries from --bin-dir ($BIN_DIR):$missing" >&2
+  echo "  expected (from $CARGO):" $EXPECTED_BINS >&2
+  exit 1
+fi
 
 APPDIR="$(mktemp -d)/Agent Buddy.AppDir"
 mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/agent-buddy"
-install -m 0755 "$GUI"    "$APPDIR/usr/bin/agent-buddy-app"
-install -m 0755 "$DAEMON" "$APPDIR/usr/bin/agent-buddy"
-# The floating desktop buddy — a sibling process the app spawns. Optional.
-[ -f "$WIDGET" ] && install -m 0755 "$WIDGET" "$APPDIR/usr/bin/agent-buddy-widget"
+# Install every declared binary side by side (agent-buddy-app is the launcher;
+# agent-buddy the daemon; agent-buddy-widget the floating desktop buddy).
+for b in $EXPECTED_BINS; do
+  install -m 0755 "$BIN_DIR/$b" "$APPDIR/usr/bin/$b"
+done
 
 if [ -n "$FW_DIR" ] && [ -d "$FW_DIR" ]; then
   shopt -s nullglob
