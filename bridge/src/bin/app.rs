@@ -134,6 +134,63 @@ const OTA_FAIL_HINT: &str = "If this keeps failing, allow “Agent Buddy” unde
 const OTA_FAIL_HINT: &str =
     "If this keeps failing, make sure this computer and your buddy are on the same Wi-Fi, then try again.";
 
+// --- design tokens ---------------------------------------------------------
+// Named scales so corner radii, type sizes, spacing, and motion stay consistent
+// across the UI instead of drifting as scattered literals. Values match the
+// original hand-tuned numbers — these just give them a meaning and a single
+// place to tune. Deliberate one-off literals (a tight 2px nudge here and there)
+// stay literal; the tokens are the house rhythm everything else snaps to.
+
+/// Corner radii (px).
+mod radius {
+    pub const CARD: f32 = 13.0; // cards + stat tiles
+    pub const CONTROL: f32 = 8.0; // buttons, text fields, generic widgets
+    pub const PILL: f32 = 7.0; // status badges
+    pub const NAV: f32 = 9.0; // nav-row fill + brand mark
+    pub const BAR: f32 = 2.0; // active-nav accent bar
+}
+
+/// Type scale (pt). Display 20/17; headings 16/15/14.5; body + UI 12.5 → 10.5.
+mod font {
+    pub const TITLE: f32 = 20.0; // page title
+    pub const HERO: f32 = 17.0; // overlay heading, stat-tile value
+    pub const H1: f32 = 16.0; // large card heading / brand wordmark
+    pub const H2: f32 = 15.0; // card heading
+    pub const H3: f32 = 14.5; // inline section heading (status row)
+    pub const BTN: f32 = 14.0; // primary-button label
+    pub const NAV: f32 = 13.5; // nav-row label
+    pub const BTN_SM: f32 = 13.0; // ghost / segmented label
+    pub const BODY: f32 = 12.5; // body copy, metrics
+    pub const LABEL: f32 = 12.0; // inline labels
+    pub const PILL: f32 = 11.5; // status-badge text
+    pub const SMALL: f32 = 11.0; // helper / footnote copy
+    pub const TINY: f32 = 10.5; // eyebrow caps, version
+}
+
+/// Vertical spacing rhythm (px) for `add_space`. Sub-`XS` nudges stay literal.
+mod gap {
+    pub const XS: f32 = 4.0;
+    pub const SM: f32 = 6.0;
+    pub const MD: f32 = 8.0;
+    pub const LG: f32 = 10.0; // between stacked cards
+    pub const XL: f32 = 12.0; // heading → call-to-action
+}
+
+/// Fixed structural sizes (px).
+mod size {
+    pub const SIDEBAR_W: f32 = 196.0;
+    pub const NAV_H: f32 = 36.0;
+    pub const BTN_H: f32 = 38.0; // primary + ghost + segmented (unified)
+    pub const CARD_PAD: f32 = 16.0; // card + tile inner padding (unified)
+}
+
+/// Animation durations (seconds) for eased UI transitions.
+mod motion {
+    pub const HOVER: f32 = 0.10; // button / nav hover fades
+    pub const NAV: f32 = 0.14; // active-nav cross-fade
+    pub const PAGE: f32 = 0.16; // content fade-in on page switch
+}
+
 // --- palette --------------------------------------------------------------
 // Harness-agnostic: neutral surfaces, a single confident teal accent, and a
 // hardware-dashboard cool cast. Two full palettes — light (default) and dark —
@@ -453,6 +510,9 @@ struct App {
     update_stage: Option<String>,
     /// Which content page the nav rail has selected.
     page: Page,
+    /// When the visible page last changed — drives the content fade-in so a nav
+    /// switch eases in rather than hard-cutting.
+    page_changed_at: Instant,
     /// Light/dark/system preference, remembered across launches.
     theme: ThemePref,
     ssid: String,
@@ -486,6 +546,9 @@ struct App {
     widget_proc: Option<std::process::Child>,
     /// Whether the desktop buddy should be showing, remembered across launches.
     widget_enabled: bool,
+    /// Desktop-buddy size scale (1.0 = base). Drives the Settings slider; the
+    /// running widget polls the persisted value and resizes live.
+    widget_scale: f32,
 }
 
 /// What a tray menu item does when clicked.
@@ -562,6 +625,7 @@ impl App {
             ota_phase: None,
             update_stage: None,
             page: Page::Overview,
+            page_changed_at: Instant::now(),
             theme: load_theme_pref(),
             ssid_autofilled: detected_ssid.is_some(),
             ssid: detected_ssid.unwrap_or_default(),
@@ -575,6 +639,7 @@ impl App {
             tray_state: TrayState::Off,
             widget_proc,
             widget_enabled,
+            widget_scale: agent_buddy::widget::load_scale(),
         }
     }
 
@@ -659,6 +724,7 @@ impl App {
             self.last_action = None;
             self.last_action_at = None;
             self.status_err = None;
+            self.page_changed_at = Instant::now();
         }
         self.page = page;
     }
@@ -757,6 +823,16 @@ impl eframe::App for App {
                             .inner_margin(egui::Margin::symmetric(26.0, 20.0))
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
+                                // Ease the page in on a nav switch (smoothstep'd
+                                // opacity), repainting until it settles.
+                                let raw = (self.page_changed_at.elapsed().as_secs_f32()
+                                    / motion::PAGE)
+                                    .clamp(0.0, 1.0);
+                                if raw < 1.0 {
+                                    ui.ctx().request_repaint();
+                                    let t = raw * raw * (3.0 - 2.0 * raw);
+                                    ui.multiply_opacity(t);
+                                }
                                 // An in-flight in-place update owns the whole
                                 // pane — no navigating away mid-swap.
                                 if let Some(stage) = self.update_stage.clone() {
@@ -780,7 +856,7 @@ impl App {
     fn sidebar(&mut self, ctx: &egui::Context, p: &Pal, dark: bool, st: Option<&StatusReport>) {
         let running = st.is_some();
         egui::SidePanel::left("nav")
-            .exact_width(196.0)
+            .exact_width(size::SIDEBAR_W)
             .resizable(false)
             .show_separator_line(true)
             .frame(
@@ -795,7 +871,7 @@ impl App {
                     let (rect, _) =
                         ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
                     ui.painter()
-                        .rect_filled(rect, egui::Rounding::same(9.0), p.accent);
+                        .rect_filled(rect, egui::Rounding::same(radius::NAV), p.accent);
                     ui.painter().text(
                         rect.center(),
                         egui::Align2::CENTER_CENTER,
@@ -809,13 +885,13 @@ impl App {
                         ui.label(
                             egui::RichText::new("Agent Buddy")
                                 .color(p.ink)
-                                .size(16.0)
+                                .size(font::H1)
                                 .family(bold()),
                         );
                         ui.label(
                             egui::RichText::new("Control panel")
                                 .color(p.muted)
-                                .size(10.5),
+                                .size(font::TINY),
                         );
                     });
                 });
@@ -846,9 +922,9 @@ impl App {
                     ui.label(
                         egui::RichText::new(env!("AGENT_BUDDY_VERSION"))
                             .color(p.faint)
-                            .size(10.5),
+                            .size(font::TINY),
                     );
-                    ui.add_space(8.0);
+                    ui.add_space(gap::MD);
                     let (glyph, label) = if dark {
                         (ic::SUN, "Light mode")
                     } else {
@@ -882,15 +958,23 @@ impl App {
                         Page::Gateway => "Gateway",
                         Page::Settings => "Settings",
                     };
-                    ui.label(egui::RichText::new(title).color(p.ink).size(20.0).family(bold()));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let (text, color) = match st {
-                            None => ("Gateway off", p.muted),
-                            Some(s) if s.device_connected => ("Buddy linked", p.good),
-                            Some(_) => ("Buddy not linked", p.muted),
-                        };
-                        pill(ui, p, text, color);
-                    });
+                    ui.label(egui::RichText::new(title).color(p.ink).size(font::TITLE).family(bold()));
+                    // The chip is the persistent, every-page connection indicator.
+                    // On a running Overview it would just echo the GATEWAY/DEVICE
+                    // status tiles right below it, so drop it there — but keep it
+                    // when the gateway is off (Overview then shows the install
+                    // card, no tiles, making this the only status cue).
+                    let redundant_here = matches!(self.page, Page::Overview) && st.is_some();
+                    if !redundant_here {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let (text, color) = match st {
+                                None => ("Gateway off", p.muted),
+                                Some(s) if s.device_connected => ("Buddy linked", p.good),
+                                Some(_) => ("Buddy not linked", p.muted),
+                            };
+                            pill(ui, p, text, color);
+                        });
+                    }
                 });
             });
     }
@@ -926,27 +1010,27 @@ impl App {
             ui.label(
                 egui::RichText::new("Update available")
                     .color(p.accent)
-                    .size(15.0)
+                    .size(font::H2)
                     .family(bold()),
             );
-            ui.add_space(4.0);
+            ui.add_space(gap::XS);
             ui.label(
                 egui::RichText::new(format!("Agent Buddy {latest} is out — you have v{current}."))
                     .color(p.muted)
-                    .size(12.5),
+                    .size(font::BODY),
             );
-            ui.add_space(12.0);
+            ui.add_space(gap::XL);
             if let Some(pkg_url) = in_place {
                 if primary_button(ui, p, &format!("Update to {latest} & restart"), !busy).clicked() {
                     want_self_update = Some(pkg_url);
                 }
-                ui.add_space(4.0);
+                ui.add_space(gap::XS);
                 ui.label(
                     egui::RichText::new(
                         "Downloads, verifies, and installs automatically, then relaunches.",
                     )
                     .color(p.muted)
-                    .size(11.0),
+                    .size(font::SMALL),
                 );
             } else {
                 #[cfg(target_os = "macos")]
@@ -956,9 +1040,9 @@ impl App {
                             "Download it, then drag it into Applications to replace this version.",
                         )
                         .color(p.muted)
-                        .size(11.0),
+                        .size(font::SMALL),
                     );
-                    ui.add_space(8.0);
+                    ui.add_space(gap::MD);
                 }
                 if primary_button(ui, p, &format!("Download {latest}"), true).clicked() {
                     open_url(&page_url);
@@ -968,7 +1052,7 @@ impl App {
         if let Some(url) = want_self_update {
             self.start_self_update(url);
         }
-        ui.add_space(10.0);
+        ui.add_space(gap::LG);
     }
 
     /// Kick off an in-place self-update: show the overlay and hand the package
@@ -983,33 +1067,33 @@ impl App {
         ui.add_space(40.0);
         card(ui, p, |ui| {
             ui.vertical_centered(|ui| {
-                ui.add_space(8.0);
+                ui.add_space(gap::MD);
                 ui.add(egui::Spinner::new().size(28.0).color(p.accent));
                 ui.add_space(14.0);
                 ui.label(
                     egui::RichText::new("Updating Agent Buddy")
                         .color(p.ink)
-                        .size(17.0)
+                        .size(font::HERO)
                         .family(bold()),
                 );
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new(stage).color(p.muted).size(13.0));
-                ui.add_space(12.0);
+                ui.add_space(gap::SM);
+                ui.label(egui::RichText::new(stage).color(p.muted).size(font::BTN_SM));
+                ui.add_space(gap::XL);
                 ui.label(
                     egui::RichText::new(
                         "Keep this window open — the app restarts itself when it’s done.",
                     )
                     .color(p.faint)
-                    .size(11.0),
+                    .size(font::SMALL),
                 );
-                ui.add_space(12.0);
+                ui.add_space(gap::XL);
                 // Abandoning the download is harmless: the swap helper only spawns
                 // after a successful download+verify, so /Applications is untouched.
                 if ghost_button(ui, p, "Cancel", true).clicked() {
                     self.update_stage = None;
                     self.busy = false;
                 }
-                ui.add_space(8.0);
+                ui.add_space(gap::MD);
             });
         });
     }
@@ -1030,10 +1114,10 @@ impl App {
                 ui.label(
                     egui::RichText::new("Updating firmware")
                         .color(p.ink)
-                        .size(15.0)
+                        .size(font::H2)
                         .family(bold()),
                 );
-                ui.add_space(10.0);
+                ui.add_space(gap::LG);
                 if let Some(pct) = pct {
                     ui.add(
                         egui::ProgressBar::new(pct as f32 / 100.0)
@@ -1048,17 +1132,17 @@ impl App {
                     });
                 }
                 if let Some(phase) = phase {
-                    ui.add_space(6.0);
-                    ui.label(egui::RichText::new(phase).color(p.muted).size(12.5));
+                    ui.add_space(gap::SM);
+                    ui.label(egui::RichText::new(phase).color(p.muted).size(font::BODY));
                 }
-                ui.add_space(8.0);
+                ui.add_space(gap::MD);
                 ui.label(
                     egui::RichText::new(
                         "Keep your buddy powered and nearby — it reboots when done. If the \
                          update is interrupted, your buddy stays safe on its current version.",
                     )
                     .color(p.faint)
-                    .size(11.5),
+                    .size(font::PILL),
                 );
             });
             return;
@@ -1079,7 +1163,7 @@ impl App {
             };
             stat_tile(&mut cols[1], p, "DEVICE", val, color, ok);
         });
-        ui.add_space(10.0);
+        ui.add_space(gap::LG);
 
         // Details card: the buddy's vitals + the firmware-update action.
         let mut want_update: Option<(String, Option<String>, Option<String>)> = None;
@@ -1088,11 +1172,11 @@ impl App {
                 ui.label(
                     egui::RichText::new(disconnected_hint(s))
                         .color(p.muted)
-                        .size(12.0),
+                        .size(font::LABEL),
                 );
-                ui.add_space(6.0);
+                ui.add_space(gap::SM);
                 hairline(ui, p);
-                ui.add_space(6.0);
+                ui.add_space(gap::SM);
             }
 
             metric(ui, p, "Owner", &s.owner);
@@ -1154,7 +1238,7 @@ impl App {
                         .as_deref()
                         .and_then(update::parse_version)
                         .is_some();
-                    ui.add_space(10.0);
+                    ui.add_space(gap::LG);
                     if newer {
                         if primary_button(
                             ui,
@@ -1175,14 +1259,14 @@ impl App {
                     // packet trips it, so explain why before the user is surprised.
                     #[cfg(target_os = "macos")]
                     if newer || !device_known {
-                        ui.add_space(6.0);
+                        ui.add_space(gap::SM);
                         ui.label(
                             egui::RichText::new(
                                 "On the first update, macOS asks to allow Agent Buddy on your \
                                  local network — that’s how it reaches your buddy over Wi-Fi.",
                             )
                             .color(p.faint)
-                            .size(11.0),
+                            .size(font::SMALL),
                         );
                     }
                 }
@@ -1198,23 +1282,23 @@ impl App {
 
         // First-run pairing guidance while the buddy isn't linked.
         if !s.device_connected {
-            ui.add_space(10.0);
+            ui.add_space(gap::LG);
             self.pairing_card(ui, p);
         }
 
         // Recent activity, if any.
         if !s.entries.is_empty() {
-            ui.add_space(10.0);
+            ui.add_space(gap::LG);
             card(ui, p, |ui| {
                 ui.label(
                     egui::RichText::new("RECENT ACTIVITY")
                         .color(p.muted)
-                        .size(10.5)
+                        .size(font::TINY)
                         .family(bold()),
                 );
-                ui.add_space(4.0);
+                ui.add_space(gap::XS);
                 for e in s.entries.iter().take(6) {
-                    ui.label(egui::RichText::new(format!("·  {e}")).color(p.ink).size(12.5));
+                    ui.label(egui::RichText::new(format!("·  {e}")).color(p.ink).size(font::BODY));
                 }
             });
         }
@@ -1228,10 +1312,10 @@ impl App {
             ui.label(
                 egui::RichText::new("Get started")
                     .color(p.ink)
-                    .size(16.0)
+                    .size(font::H1)
                     .family(bold()),
             );
-            ui.add_space(6.0);
+            ui.add_space(gap::SM);
             ui.label(
                 egui::RichText::new(
                     "The gateway isn’t running yet. Install it once and it stays on — \
@@ -1239,16 +1323,16 @@ impl App {
                      is closed.",
                 )
                 .color(p.muted)
-                .size(12.5),
+                .size(font::BODY),
             );
-            ui.add_space(12.0);
+            ui.add_space(gap::XL);
             if primary_button(ui, p, "Install & start gateway", !self.busy).clicked() {
                 self.send(Cmd::InstallStart);
             }
             if let Some(err) = &self.status_err {
                 if !err.contains("isn’t running") {
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new(err).color(p.bad).size(11.0));
+                    ui.add_space(gap::MD);
+                    ui.label(egui::RichText::new(err).color(p.bad).size(font::SMALL));
                 }
             }
         });
@@ -1263,10 +1347,10 @@ impl App {
             ui.label(
                 egui::RichText::new("Pair your buddy")
                     .color(p.ink)
-                    .size(15.0)
+                    .size(font::H2)
                     .family(bold()),
             );
-            ui.add_space(4.0);
+            ui.add_space(gap::XS);
             ui.label(
                 egui::RichText::new(
                     "Power on your buddy and keep it nearby. The first time, it shows a \
@@ -1274,9 +1358,9 @@ impl App {
                      match to pair. After that it reconnects on its own.",
                 )
                 .color(p.muted)
-                .size(12.5),
+                .size(font::BODY),
             );
-            ui.add_space(12.0);
+            ui.add_space(gap::XL);
             ui.horizontal(|ui| {
                 if ghost_button(ui, p, "Open Bluetooth settings", true).clicked() {
                     open_bluetooth_settings();
@@ -1298,7 +1382,7 @@ impl App {
             ui.label(
                 egui::RichText::new("Provision Wi-Fi")
                     .color(p.ink)
-                    .size(15.0)
+                    .size(font::H2)
                     .family(bold()),
             );
             ui.add_space(2.0);
@@ -1310,7 +1394,7 @@ impl App {
                          to a different network."
                     ))
                     .color(p.muted)
-                    .size(12.5),
+                    .size(font::BODY),
                 );
             } else {
                 ui.label(
@@ -1318,10 +1402,10 @@ impl App {
                         "Send your network to the buddy so it can update over the air.",
                     )
                     .color(p.muted)
-                    .size(12.5),
+                    .size(font::BODY),
                 );
             }
-            ui.add_space(12.0);
+            ui.add_space(gap::XL);
             self.wifi_form(ui, p, connected);
         });
         self.action_feedback(ui, p);
@@ -1338,31 +1422,31 @@ impl App {
                     "Couldn’t read your current network automatically — type your Wi-Fi name.",
                 )
                 .color(p.muted)
-                .size(11.0),
+                .size(font::SMALL),
             );
         }
-        ui.add_space(8.0);
+        ui.add_space(gap::MD);
 
         field_label(ui, p, "Password");
         text_field(ui, &mut self.pass, "Wi-Fi password", !self.show_pass);
         ui.add_space(3.0);
         ui.checkbox(
             &mut self.show_pass,
-            egui::RichText::new("Show password").size(11.0).color(p.muted),
+            egui::RichText::new("Show password").size(font::SMALL).color(p.muted),
         );
 
-        ui.add_space(12.0);
+        ui.add_space(gap::XL);
         let can_send = connected && !self.busy && !self.ssid.trim().is_empty();
         if primary_button(ui, p, "Send to buddy", can_send).clicked() {
             let (ssid, pass) = (self.ssid.trim().to_string(), self.pass.clone());
             self.send(Cmd::Provision { ssid, pass });
         }
         if !connected {
-            ui.add_space(8.0);
+            ui.add_space(gap::MD);
             ui.label(
                 egui::RichText::new("Wake the buddy and wait for “linked” first.")
                     .color(p.muted)
-                    .size(11.0),
+                    .size(font::SMALL),
             );
         }
     }
@@ -1371,7 +1455,7 @@ impl App {
         let running = self.status.is_some();
         card(ui, p, |ui| {
             status_row(ui, p, "Gateway", running, if running { "running" } else { "stopped" });
-            ui.add_space(8.0);
+            ui.add_space(gap::MD);
             ui.label(
                 egui::RichText::new(
                     "The gateway is the always-on background service that keeps your buddy \
@@ -1379,9 +1463,9 @@ impl App {
                      closing.",
                 )
                 .color(p.muted)
-                .size(12.5),
+                .size(font::BODY),
             );
-            ui.add_space(12.0);
+            ui.add_space(gap::XL);
             ui.horizontal(|ui| {
                 if ghost_button(ui, p, "Restart", !self.busy).clicked() {
                     self.send(Cmd::Restart);
@@ -1395,11 +1479,11 @@ impl App {
                 }
             });
             if running {
-                ui.add_space(6.0);
+                ui.add_space(gap::SM);
                 ui.label(
                     egui::RichText::new("Kept alive automatically.")
                         .color(p.muted)
-                        .size(11.0),
+                        .size(font::SMALL),
                 );
             }
         });
@@ -1412,45 +1496,62 @@ impl App {
             ui.label(
                 egui::RichText::new("Appearance")
                     .color(p.ink)
-                    .size(15.0)
+                    .size(font::H2)
                     .family(bold()),
             );
-            ui.add_space(8.0);
+            ui.add_space(gap::MD);
             field_label(ui, p, "Theme");
             if let Some(choice) = theme_segmented(ui, p, self.theme) {
                 self.theme = choice;
                 save_theme_pref(self.theme);
             }
-            ui.add_space(4.0);
+            ui.add_space(gap::XS);
             ui.label(
                 egui::RichText::new("“System” follows your operating system’s light/dark setting.")
                     .color(p.muted)
-                    .size(11.0),
+                    .size(font::SMALL),
             );
         });
 
         // Desktop buddy — the floating mascot. The control here works on every
         // platform (the tray toggle isn't available on Linux), so there's always
         // a way to turn it on/off.
-        ui.add_space(10.0);
+        ui.add_space(gap::LG);
         let mut want_widget = self.widget_enabled;
         card(ui, p, |ui| {
             ui.label(
                 egui::RichText::new("Desktop buddy")
                     .color(p.ink)
-                    .size(15.0)
+                    .size(font::H2)
                     .family(bold()),
             );
-            ui.add_space(8.0);
+            ui.add_space(gap::MD);
             ui.checkbox(&mut want_widget, "Show the floating desktop buddy");
-            ui.add_space(4.0);
+            ui.add_space(gap::XS);
             ui.label(
                 egui::RichText::new(
                     "A small always-on-top character that reacts to your coding sessions. Drag it anywhere; nudge it to a screen edge to tuck it away.",
                 )
                 .color(p.muted)
-                .size(11.0),
+                .size(font::SMALL),
             );
+
+            // Size slider — persists the scale; the running widget resizes live.
+            ui.add_space(gap::LG);
+            ui.label(egui::RichText::new("Size").color(p.ink).size(font::LABEL));
+            ui.add_space(2.0);
+            let mut scale = self.widget_scale;
+            let resp = ui.add(
+                egui::Slider::new(
+                    &mut scale,
+                    agent_buddy::widget::MIN_SCALE..=agent_buddy::widget::MAX_SCALE,
+                )
+                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+            );
+            if resp.changed() {
+                self.widget_scale = scale;
+                agent_buddy::widget::save_scale(scale);
+            }
         });
         if want_widget != self.widget_enabled {
             self.set_widget_enabled(want_widget);
@@ -1461,7 +1562,7 @@ impl App {
         // gateway (it's what supplies the available-agents list).
         if let Some(s) = st {
             if !s.available_agents.is_empty() {
-                ui.add_space(10.0);
+                ui.add_space(gap::LG);
                 let current = s.active_agent.clone();
                 let agents = s.available_agents.clone();
                 let current_name = agents
@@ -1472,8 +1573,8 @@ impl App {
                 let busy = self.busy;
                 let mut chosen: Option<String> = None;
                 card(ui, p, |ui| {
-                    ui.label(egui::RichText::new("Agent").color(p.ink).size(15.0).family(bold()));
-                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("Agent").color(p.ink).size(font::H2).family(bold()));
+                    ui.add_space(gap::MD);
                     field_label(ui, p, "Coding agent the buddy follows");
                     ui.add_enabled_ui(!busy, |ui| {
                         egui::ComboBox::from_id_source("agent_selector")
@@ -1489,13 +1590,13 @@ impl App {
                                 }
                             });
                     });
-                    ui.add_space(4.0);
+                    ui.add_space(gap::XS);
                     ui.label(
                         egui::RichText::new(
                             "Switching re-wires that agent’s hooks and re-themes your buddy.",
                         )
                         .color(p.muted)
-                        .size(11.0),
+                        .size(font::SMALL),
                     );
                 });
                 if let Some(id) = chosen {
@@ -1506,34 +1607,34 @@ impl App {
 
         // App update banner — one-click in-place update where supported, else a
         // guided download. (Also shown at the top of Overview.)
-        ui.add_space(10.0);
+        ui.add_space(gap::LG);
         self.update_banner(ui, p, st);
 
         // About.
-        ui.add_space(10.0);
+        ui.add_space(gap::LG);
         card(ui, p, |ui| {
             ui.label(
                 egui::RichText::new("About")
                     .color(p.ink)
-                    .size(15.0)
+                    .size(font::H2)
                     .family(bold()),
             );
-            ui.add_space(8.0);
+            ui.add_space(gap::MD);
             metric(ui, p, "Version", env!("AGENT_BUDDY_VERSION"));
             if let Some(s) = st {
                 if let Some(fw) = &s.device_fw {
                     metric(ui, p, "Buddy firmware", fw);
                 }
             }
-            ui.add_space(8.0);
+            ui.add_space(gap::MD);
             ui.collapsing(
-                egui::RichText::new("Third-party licenses").color(p.muted).size(12.0),
+                egui::RichText::new("Third-party licenses").color(p.muted).size(font::LABEL),
                 |ui| {
                     ui.label(
                         egui::RichText::new(THIRD_PARTY_LICENSES)
                             .color(p.muted)
                             .monospace()
-                            .size(10.5),
+                            .size(font::TINY),
                     );
                 },
             );
@@ -1541,15 +1642,15 @@ impl App {
 
         // Uninstall — removes everything Agent Buddy installed; gated behind an
         // inline confirmation so the click is informed, not a trap.
-        ui.add_space(10.0);
+        ui.add_space(gap::LG);
         card(ui, p, |ui| {
             ui.label(
                 egui::RichText::new("Uninstall")
                     .color(p.ink)
-                    .size(15.0)
+                    .size(font::H2)
                     .family(bold()),
             );
-            ui.add_space(6.0);
+            ui.add_space(gap::SM);
             if self.pending_uninstall {
                 ui.label(
                     egui::RichText::new(
@@ -1558,9 +1659,9 @@ impl App {
                          Your buddy device and its firmware are not touched.",
                     )
                     .color(p.muted)
-                    .size(12.0),
+                    .size(font::LABEL),
                 );
-                ui.add_space(10.0);
+                ui.add_space(gap::LG);
                 ui.horizontal(|ui| {
                     if primary_button_compact(ui, p, "Uninstall everything", !self.busy).clicked() {
                         self.pending_uninstall = false;
@@ -1574,9 +1675,9 @@ impl App {
                 ui.label(
                     egui::RichText::new("Remove Agent Buddy and everything it installed.")
                         .color(p.muted)
-                        .size(12.0),
+                        .size(font::LABEL),
                 );
-                ui.add_space(10.0);
+                ui.add_space(gap::LG);
                 if ghost_button(ui, p, "Uninstall Agent Buddy…", !self.busy).clicked() {
                     self.pending_uninstall = true;
                 }
@@ -1592,10 +1693,10 @@ impl App {
         // How long a result lingers before it auto-dismisses.
         const DISMISS_AFTER: Duration = Duration::from_secs(6);
         if self.busy {
-            ui.add_space(12.0);
+            ui.add_space(gap::XL);
             ui.horizontal(|ui| {
                 ui.add(egui::Spinner::new().size(14.0).color(p.accent));
-                ui.label(egui::RichText::new("Working…").color(p.muted).size(12.0));
+                ui.label(egui::RichText::new("Working…").color(p.muted).size(font::LABEL));
             });
             return;
         }
@@ -1610,11 +1711,11 @@ impl App {
             } else {
                 (ic::CROSS, p.bad)
             };
-            ui.add_space(12.0);
+            ui.add_space(gap::XL);
             ui.horizontal_top(|ui| {
                 ui.label(egui::RichText::new(mark).color(color).font(icon_font(13.0)));
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new(text).color(color).size(12.0));
+                ui.add_space(gap::SM);
+                ui.label(egui::RichText::new(text).color(color).size(font::LABEL));
             });
         }
     }
@@ -2066,7 +2167,7 @@ fn apply_style(ctx: &egui::Context, p: &Pal, dark: bool) {
         &mut style.visuals.widgets.active,
         &mut style.visuals.widgets.open,
     ] {
-        w.rounding = egui::Rounding::same(8.0);
+        w.rounding = egui::Rounding::same(radius::CONTROL);
     }
     style.visuals.widgets.inactive.bg_fill = p.field;
     style.visuals.widgets.inactive.weak_bg_fill = p.field;
@@ -2096,7 +2197,7 @@ fn nav_item(
     active: bool,
     enabled: bool,
 ) -> bool {
-    let h = 36.0;
+    let h = size::NAV_H;
     let (rect, resp) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), h),
         if enabled {
@@ -2106,24 +2207,44 @@ fn nav_item(
         },
     );
     let hovered = enabled && resp.hovered();
+    // Ease the active + hover states so selecting a row cross-fades (the old row
+    // fades its tint/bar out as the new one fades in) instead of snapping. Keyed
+    // on the label so each row keeps its own animation across frames.
+    let ctx = ui.ctx();
+    let anim = egui::Id::new(("nav-anim", label));
+    let t_active = ctx.animate_bool_with_time(anim.with("active"), active, motion::NAV);
+    let t_hover = ctx.animate_bool_with_time(anim.with("hover"), hovered, motion::HOVER);
     let painter = ui.painter();
-    if active {
-        painter.rect_filled(rect, egui::Rounding::same(9.0), p.nav_active);
-        let bar = egui::Rect::from_min_size(
-            rect.left_top() + egui::vec2(0.0, 8.0),
-            egui::vec2(3.0, h - 16.0),
+    // Hover wash, receding as the active tint takes over so they never stack.
+    if t_hover > 0.0 && t_active < 1.0 {
+        painter.rect_filled(
+            rect,
+            egui::Rounding::same(radius::NAV),
+            p.hair.gamma_multiply(t_hover * (1.0 - t_active)),
         );
-        painter.rect_filled(bar, egui::Rounding::same(2.0), p.accent);
-    } else if hovered {
-        painter.rect_filled(rect, egui::Rounding::same(9.0), p.hair);
     }
-    let color = if !enabled {
-        p.faint
-    } else if active {
-        p.accent
-    } else {
-        p.ink
-    };
+    if t_active > 0.0 {
+        painter.rect_filled(
+            rect,
+            egui::Rounding::same(radius::NAV),
+            p.nav_active.gamma_multiply(t_active),
+        );
+        // The accent bar fades in and grows from its own vertical center.
+        let half = (h - 16.0) * 0.5 * (0.5 + 0.5 * t_active);
+        let mid = rect.left_center().y;
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(rect.left(), mid - half),
+            egui::pos2(rect.left() + 3.0, mid + half),
+        );
+        painter.rect_filled(
+            bar,
+            egui::Rounding::same(radius::BAR),
+            p.accent.gamma_multiply(t_active),
+        );
+    }
+    // Text/icon tint lerps from the resting color toward accent as it activates.
+    let base = if enabled { p.ink } else { p.faint };
+    let color = if enabled { mix(base, p.accent, t_active) } else { base };
     // Icon and label are painted separately: the icon needs the Lucide family,
     // the label the proportional one, and a fixed label offset keeps every row's
     // text aligned regardless of icon width.
@@ -2138,7 +2259,7 @@ fn nav_item(
         rect.left_center() + egui::vec2(34.0, 0.0),
         egui::Align2::LEFT_CENTER,
         label,
-        egui::FontId::proportional(13.5),
+        egui::FontId::proportional(font::NAV),
         color,
     );
     resp.clicked()
@@ -2160,10 +2281,10 @@ fn card_shadow(p: &Pal) -> egui::epaint::Shadow {
 fn card(ui: &mut egui::Ui, p: &Pal, add: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::none()
         .fill(p.card)
-        .rounding(egui::Rounding::same(13.0))
+        .rounding(egui::Rounding::same(radius::CARD))
         .stroke(egui::Stroke::new(1.0, p.hair))
         .shadow(card_shadow(p))
-        .inner_margin(egui::Margin::same(16.0))
+        .inner_margin(egui::Margin::same(size::CARD_PAD))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             add(ui);
@@ -2174,23 +2295,23 @@ fn card(ui: &mut egui::Ui, p: &Pal, add: impl FnOnce(&mut egui::Ui)) {
 fn stat_tile(ui: &mut egui::Ui, p: &Pal, title: &str, value: &str, color: egui::Color32, ok: bool) {
     egui::Frame::none()
         .fill(p.card)
-        .rounding(egui::Rounding::same(13.0))
+        .rounding(egui::Rounding::same(radius::CARD))
         .stroke(egui::Stroke::new(1.0, p.hair))
         .shadow(card_shadow(p))
-        .inner_margin(egui::Margin::same(15.0))
+        .inner_margin(egui::Margin::same(size::CARD_PAD))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(
                 egui::RichText::new(title)
                     .color(p.muted)
-                    .size(10.5)
+                    .size(font::TINY)
                     .family(bold()),
             );
             ui.add_space(7.0);
             ui.horizontal(|ui| {
                 dot(ui, if ok { color } else { p.faint }, 4.0);
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new(value).color(color).size(17.0).family(bold()));
+                ui.add_space(gap::SM);
+                ui.label(egui::RichText::new(value).color(color).size(font::HERO).family(bold()));
             });
         });
 }
@@ -2211,7 +2332,7 @@ fn hairline(ui: &mut egui::Ui, p: &Pal) {
 fn status_row(ui: &mut egui::Ui, p: &Pal, label: &str, ok: bool, value: &str) {
     let color = if ok { p.good } else { p.muted };
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(label).color(p.ink).size(14.5).family(bold()));
+        ui.label(egui::RichText::new(label).color(p.ink).size(font::H3).family(bold()));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             pill(ui, p, value, color);
         });
@@ -2224,13 +2345,13 @@ fn status_row(ui: &mut egui::Ui, p: &Pal, label: &str, ok: bool, value: &str) {
 fn pill(ui: &mut egui::Ui, p: &Pal, text: &str, color: egui::Color32) {
     egui::Frame::none()
         .fill(mix(color, p.card, 0.86))
-        .rounding(egui::Rounding::same(7.0))
+        .rounding(egui::Rounding::same(radius::PILL))
         .inner_margin(egui::Margin::symmetric(9.0, 4.0))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 dot(ui, color, 3.5);
                 ui.add_space(5.0);
-                ui.label(egui::RichText::new(text).color(color).size(11.5).family(bold()));
+                ui.label(egui::RichText::new(text).color(color).size(font::PILL).family(bold()));
             });
         });
 }
@@ -2247,17 +2368,17 @@ fn metric(ui: &mut egui::Ui, p: &Pal, label: &str, value: &str) {
 
 fn metric_colored(ui: &mut egui::Ui, p: &Pal, label: &str, value: &str, color: egui::Color32) {
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(label).color(p.muted).size(12.5));
+        ui.label(egui::RichText::new(label).color(p.muted).size(font::BODY));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(egui::RichText::new(value).color(color).size(12.5).family(bold()));
+            ui.label(egui::RichText::new(value).color(color).size(font::BODY).family(bold()));
         });
     });
     ui.add_space(2.0);
 }
 
 fn field_label(ui: &mut egui::Ui, p: &Pal, text: &str) {
-    ui.label(egui::RichText::new(text).color(p.muted).size(11.0).family(bold()));
-    ui.add_space(4.0);
+    ui.label(egui::RichText::new(text).color(p.muted).size(font::SMALL).family(bold()));
+    ui.add_space(gap::XS);
 }
 
 /// A roomy full-width single-line input. The generous inner margin gives it a
@@ -2294,30 +2415,38 @@ fn primary_button_sized(
 ) -> egui::Response {
     let resp = ui.add_enabled(
         enabled,
-        egui::Button::new(egui::RichText::new(text).color(p.on_accent).size(14.0))
+        egui::Button::new(egui::RichText::new(text).color(p.on_accent).size(font::BTN))
             .fill(p.accent)
-            .rounding(egui::Rounding::same(8.0))
-            .min_size(egui::vec2(width, 38.0)),
+            .rounding(egui::Rounding::same(radius::CONTROL))
+            .min_size(egui::vec2(width, size::BTN_H)),
     );
     // egui won't recolor an explicit `.fill`, so paint the hover/press state on
     // top for tactile feedback: darker accent when pressed, a hair on hover.
-    // (Same 8px rounding as the button beneath, so the overlay registers.)
+    // The hover tint eases in/out (keyed on the button id) so the feedback feels
+    // tactile rather than a hard flip; a press reads instantly.
+    // (Same rounding as the button beneath, so the overlay registers.)
     if enabled {
-        let over = if resp.is_pointer_button_down_on() {
+        let pressed = resp.is_pointer_button_down_on();
+        let t_hover = ui.ctx().animate_bool_with_time(
+            resp.id.with("btn-hover"),
+            resp.hovered() && !pressed,
+            motion::HOVER,
+        );
+        let over = if pressed {
             Some(p.accent_hover)
-        } else if resp.hovered() {
-            Some(mix(p.accent, p.accent_hover, 0.5))
+        } else if t_hover > 0.0 {
+            Some(mix(p.accent, p.accent_hover, 0.5).gamma_multiply(t_hover))
         } else {
             None
         };
         if let Some(fill) = over {
             ui.painter()
-                .rect_filled(resp.rect, egui::Rounding::same(8.0), fill);
+                .rect_filled(resp.rect, egui::Rounding::same(radius::CONTROL), fill);
             ui.painter().text(
                 resp.rect.center(),
                 egui::Align2::CENTER_CENTER,
                 text,
-                egui::FontId::proportional(14.0),
+                egui::FontId::proportional(font::BTN),
                 p.on_accent,
             );
         }
@@ -2328,11 +2457,11 @@ fn primary_button_sized(
 fn ghost_button(ui: &mut egui::Ui, p: &Pal, text: &str, enabled: bool) -> egui::Response {
     ui.add_enabled(
         enabled,
-        egui::Button::new(egui::RichText::new(text).color(p.ink).size(13.0))
+        egui::Button::new(egui::RichText::new(text).color(p.ink).size(font::BTN_SM))
             .fill(p.card)
-            .rounding(egui::Rounding::same(8.0))
+            .rounding(egui::Rounding::same(radius::CONTROL))
             .stroke(egui::Stroke::new(1.0, p.hair))
-            .min_size(egui::vec2(0.0, 36.0)),
+            .min_size(egui::vec2(0.0, size::BTN_H)),
     )
 }
 
@@ -2353,11 +2482,11 @@ fn theme_segmented(ui: &mut egui::Ui, p: &Pal, current: ThemePref) -> Option<The
                 (p.card, p.ink, p.hair)
             };
             let resp = ui.add(
-                egui::Button::new(egui::RichText::new(label).color(txt).size(13.0))
+                egui::Button::new(egui::RichText::new(label).color(txt).size(font::BTN_SM))
                     .fill(fill)
-                    .rounding(egui::Rounding::same(8.0))
+                    .rounding(egui::Rounding::same(radius::CONTROL))
                     .stroke(egui::Stroke::new(1.0, stroke))
-                    .min_size(egui::vec2(90.0, 36.0)),
+                    .min_size(egui::vec2(90.0, size::BTN_H)),
             );
             if resp.clicked() {
                 chosen = Some(t);

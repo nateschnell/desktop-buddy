@@ -24,9 +24,16 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
-/// Outer size of the floating window, in points. The art (≤128–252px) is fit and
-/// centered inside with headroom for accents (sparkles/heart above the head).
+/// Base outer size of the floating window, in points, at scale 1.0. The art
+/// (≤128–252px) is fit and centered inside with headroom for accents
+/// (sparkles/heart above the head). The user-set scale multiplies this.
 pub const WIDGET_SIZE: f32 = 200.0;
+/// Bounds for the user size slider (1.0 = the base [`WIDGET_SIZE`] window).
+pub const MIN_SCALE: f32 = 0.5;
+pub const MAX_SCALE: f32 = 2.5;
+/// How often the running widget re-reads `widget_scale` to pick up live slider
+/// drags from the control panel (a different process).
+const SCALE_POLL: Duration = Duration::from_millis(150);
 /// How long the base state must stay idle before the buddy falls asleep.
 const SLEEP_AFTER: Duration = Duration::from_secs(60);
 /// Default per-frame duration when a pack carries no `pipeline-meta.json`.
@@ -180,6 +187,9 @@ pub struct BuddyWidget {
     peeked: bool,
     last_hover: Instant,
     saved_pos: Option<egui::Pos2>,
+    // user size scale (1.0 = base WIDGET_SIZE), polled live from disk
+    scale: f32,
+    last_scale_check: Instant,
 }
 
 impl BuddyWidget {
@@ -201,6 +211,23 @@ impl BuddyWidget {
             peeked: false,
             last_hover: now,
             saved_pos: load_pos(),
+            scale: load_scale(),
+            last_scale_check: now,
+        }
+    }
+
+    /// Pick up a live size change from the control panel: re-read `widget_scale`
+    /// (debounced) and, if it moved, resize the window in place.
+    fn poll_scale(&mut self, ctx: &egui::Context, now: Instant) {
+        if now.duration_since(self.last_scale_check) < SCALE_POLL {
+            return;
+        }
+        self.last_scale_check = now;
+        let s = load_scale();
+        if (s - self.scale).abs() > 0.001 {
+            self.scale = s;
+            let side = WIDGET_SIZE * s;
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(side, side)));
         }
     }
 
@@ -234,6 +261,9 @@ impl eframe::App for BuddyWidget {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let now = Instant::now();
+
+        // Live size: pick up control-panel slider drags and resize in place.
+        self.poll_scale(ctx, now);
 
         // Drain status; swap agent if it changed.
         while let Ok(s) = self.rx.try_recv() {
@@ -288,7 +318,7 @@ impl eframe::App for BuddyWidget {
                     .map(|l| {
                         let n = l.frames.len().max(1);
                         let idx = ((elapsed * 1000.0 / frame_ms as f32) as usize) % n;
-                        paint_texture(ui, rect, &l.frames[idx]);
+                        paint_texture(ui, rect, &l.frames[idx], self.scale);
                     })
                     .is_some();
                 if !painted {
@@ -342,12 +372,15 @@ impl BuddyWidget {
             return; // already in the desired state
         }
         let Some(edge) = self.docked else { return };
+        // Use the live window size (it scales with the user slider), not the base.
+        let w = outer.width();
+        let h = outer.height();
         let target = match (edge, want_peek) {
-            (Edge::Left, true) => egui::pos2(PEEK_SLIVER - WIDGET_SIZE, outer.min.y),
+            (Edge::Left, true) => egui::pos2(PEEK_SLIVER - w, outer.min.y),
             (Edge::Left, false) => egui::pos2(0.0, outer.min.y),
             (Edge::Right, true) => egui::pos2(monitor.x - PEEK_SLIVER, outer.min.y),
-            (Edge::Right, false) => egui::pos2(monitor.x - WIDGET_SIZE, outer.min.y),
-            (Edge::Top, true) => egui::pos2(outer.min.x, PEEK_SLIVER - WIDGET_SIZE),
+            (Edge::Right, false) => egui::pos2(monitor.x - w, outer.min.y),
+            (Edge::Top, true) => egui::pos2(outer.min.x, PEEK_SLIVER - h),
             (Edge::Top, false) => egui::pos2(outer.min.x, 0.0),
         };
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target));
@@ -484,10 +517,13 @@ fn decode_to_texture(ctx: &egui::Context, bytes: &[u8], name: &str) -> Option<eg
     Some(ctx.load_texture(name, color, egui::TextureOptions::LINEAR))
 }
 
-/// Paint a texture fit (aspect-preserved) and centered in `rect`.
-fn paint_texture(ui: &egui::Ui, rect: egui::Rect, tex: &egui::TextureHandle) {
+/// Paint a texture fit (aspect-preserved) and centered in `rect`. `user_scale`
+/// lifts the upscale cap proportionally so the buddy keeps filling a larger
+/// window (without it, art would stop growing at 1.5× and float small inside).
+fn paint_texture(ui: &egui::Ui, rect: egui::Rect, tex: &egui::TextureHandle, user_scale: f32) {
     let size = tex.size_vec2();
-    let scale = (rect.width() / size.x).min(rect.height() / size.y).min(1.5);
+    let cap = 1.5 * user_scale.max(1.0);
+    let scale = (rect.width() / size.x).min(rect.height() / size.y).min(cap);
     let draw = size * scale;
     let at = egui::Rect::from_center_size(rect.center(), draw);
     egui::Image::new((tex.id(), draw)).paint_at(ui, at);
@@ -641,6 +677,29 @@ pub fn load_pos() -> Option<egui::Pos2> {
 fn save_pos(p: egui::Pos2) {
     if let Some(path) = pos_path() {
         let _ = std::fs::write(path, format!("{},{}", p.x, p.y));
+    }
+}
+
+fn scale_path() -> Option<PathBuf> {
+    crate::state::config_dir().ok().map(|d| d.join("widget_scale"))
+}
+
+/// Read the saved size scale (default 1.0), clamped to the slider bounds. Used by
+/// the widget binary to seed its initial window size and by the control panel to
+/// initialize the slider.
+pub fn load_scale() -> f32 {
+    let v = scale_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| t.trim().parse::<f32>().ok())
+        .unwrap_or(1.0);
+    v.clamp(MIN_SCALE, MAX_SCALE)
+}
+
+/// Persist the size scale (clamped). The running widget polls this file and
+/// resizes live, so the control-panel slider updates the buddy as you drag.
+pub fn save_scale(s: f32) {
+    if let Some(path) = scale_path() {
+        let _ = std::fs::write(path, format!("{}", s.clamp(MIN_SCALE, MAX_SCALE)));
     }
 }
 

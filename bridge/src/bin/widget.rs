@@ -27,9 +27,10 @@ fn main() -> eframe::Result<()> {
     // exit so we can't orphan on screen.
     spawn_parent_watch();
 
+    let side = WIDGET_SIZE * widget::load_scale();
     let mut builder = egui::ViewportBuilder::default()
         .with_title("Agent Buddy")
-        .with_inner_size([WIDGET_SIZE, WIDGET_SIZE])
+        .with_inner_size([side, side])
         .with_transparent(true)
         .with_decorations(false)
         .with_always_on_top()
