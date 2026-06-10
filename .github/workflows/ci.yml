@@ -1,0 +1,50 @@
+name: ci
+
+# Validate contributor PRs to the open-source gateway. This is the OSS-facing
+# half of the workflow: `bridge/` + `packaging/` here are a mirror of a private
+# monorepo (firmware is closed and lives there), so a PR you open should build
+# the bridge exactly as the release does. A maintainer reviews accepted PRs and
+# back-ports them into the monorepo, from which they sync back here. See
+# CONTRIBUTING.md.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  bridge:
+    name: bridge build + test (--features gui)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bridge
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bridge
+          key: ci-gui
+      # The GUI build needs BLE/libdbus + egui/tray dev headers.
+      - name: Linux build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libdbus-1-dev pkg-config \
+            libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libssl-dev libxdo-dev libayatana-appindicator3-dev
+      - name: cargo check (daemon + GUI)
+        run: cargo check --locked --features gui
+      - name: cargo test
+        run: cargo test --locked
