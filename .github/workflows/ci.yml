@@ -29,6 +29,11 @@ jobs:
         working-directory: bridge
     steps:
       - uses: actions/checkout@v6
+        with:
+          # Tags so build.rs's `git describe --tags --match 'v*'` bakes a real
+          # version into AGENT_BUDDY_VERSION (else a bare hash, which the
+          # baked_version_is_present_and_parseable test rejects).
+          fetch-depth: 0
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Cache Rust build
