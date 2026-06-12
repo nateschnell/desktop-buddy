@@ -60,6 +60,18 @@ fn icon_font(size: f32) -> egui::FontId {
     egui::FontId::new(size, egui::FontFamily::Name("icons".into()))
 }
 
+fn app_icon() -> Option<egui::IconData> {
+    let image = image::load_from_memory(include_bytes!("../../assets/app-icon.png"))
+        .ok()?
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+    Some(egui::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    })
+}
+
 /// The family carrying the bundled SemiBold weight. egui has no synthetic bold —
 /// `RichText::strong()` only swaps in a color, which we already override — so the
 /// only way to get real weight contrast is to route emphasized text through its
@@ -374,11 +386,16 @@ fn main() -> eframe::Result<()> {
         }
     };
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([960.0, 620.0])
+        .with_min_inner_size([780.0, 500.0])
+        .with_title("Agent Buddy");
+    if let Some(icon) = app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([960.0, 620.0])
-            .with_min_inner_size([780.0, 500.0])
-            .with_title("Agent Buddy"),
+        viewport,
         // Open at the coded size every launch, centered. eframe otherwise
         // persists the last window geometry to storage — which is why a changed
         // default looks like it "didn't take": the remembered size wins. A
@@ -1805,11 +1822,6 @@ fn build_tray() -> Result<tray_icon::TrayIcon, Box<dyn std::error::Error>> {
         .with_tooltip(TrayState::Off.tooltip())
         .with_menu(Box::new(menu))
         .with_icon(tray_icon_image(TrayState::Off));
-    // On macOS a template image lets the system tint the glyph to match the menu
-    // bar (light/dark, reduce-transparency) — so it never looks pasted-on. State
-    // must read from shape, not colour, because the tint overrides our RGB.
-    #[cfg(target_os = "macos")]
-    let builder = builder.with_icon_as_template(true);
     let tray = builder.build()?;
     Ok(tray)
 }
@@ -1850,46 +1862,78 @@ fn spawn_event_drain() {
     });
 }
 
-/// A 32×32 RGBA tray glyph drawn in code (no asset to ship) whose *shape* encodes
-/// connection state: Linked → filled disc, Idle → outline ring, Off → faint ring.
-/// On macOS it's a template (the system tints it), so state must read from shape;
-/// elsewhere it carries the brand teal (a muted grey when off), since those
-/// platforms show our colours as-is. Rim and ring edges are anti-aliased.
+/// A 32×32 RGBA tray glyph drawn in code so it stays crisp in menu bars: the
+/// same prompt-face mark as the app icon, with the status LED carrying the
+/// connection state.
 #[cfg(not(target_os = "linux"))]
 fn tray_icon_image(state: TrayState) -> tray_icon::Icon {
     const N: u32 = 32;
     let mut rgba = vec![0u8; (N * N * 4) as usize];
-    let c = (N as f32 - 1.0) / 2.0;
-    let r = c; // outer radius
-    let ring_inner = r - 5.0; // ~5px ring thickness when not filled
-    let filled = matches!(state, TrayState::Linked);
-    // Template images ignore RGB (alpha is the mask); colour only matters off-mac.
-    #[cfg(target_os = "macos")]
-    let (cr, cg, cb) = (0u8, 0u8, 0u8);
-    #[cfg(not(target_os = "macos"))]
-    let (cr, cg, cb): (u8, u8, u8) = match state {
-        TrayState::Off => (0x8A, 0x8F, 0x90), // muted grey
-        _ => (0x0D, 0x94, 0x88),              // brand teal
+
+    fn blend(dst: &mut [u8], color: [u8; 4], cov: f32) {
+        let a = (color[3] as f32 / 255.0) * cov.clamp(0.0, 1.0);
+        if a <= 0.0 {
+            return;
+        }
+        let da = dst[3] as f32 / 255.0;
+        let out_a = a + da * (1.0 - a);
+        for i in 0..3 {
+            let src = color[i] as f32 / 255.0;
+            let old = dst[i] as f32 / 255.0;
+            dst[i] = (((src * a + old * da * (1.0 - a)) / out_a) * 255.0).round() as u8;
+        }
+        dst[3] = (out_a * 255.0).round() as u8;
+    }
+
+    fn sd_round_rect(x: f32, y: f32, cx: f32, cy: f32, hw: f32, hh: f32, r: f32) -> f32 {
+        let qx = (x - cx).abs() - (hw - r);
+        let qy = (y - cy).abs() - (hh - r);
+        qx.max(qy).min(0.0) + qx.max(0.0).hypot(qy.max(0.0)) - r
+    }
+
+    fn line_dist(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
+        let vx = bx - ax;
+        let vy = by - ay;
+        let wx = px - ax;
+        let wy = py - ay;
+        let t = ((wx * vx + wy * vy) / (vx * vx + vy * vy)).clamp(0.0, 1.0);
+        (px - (ax + t * vx)).hypot(py - (ay + t * vy))
+    }
+
+    let led = match state {
+        TrayState::Off => [0x95, 0x9A, 0x9A, 0xE0],
+        TrayState::Idle => [0x21, 0xC7, 0xBD, 0xF2],
+        TrayState::Linked => [0x00, 0xF0, 0xDF, 0xFF],
     };
-    let max_alpha: f32 = if matches!(state, TrayState::Off) { 0.5 } else { 1.0 };
     for y in 0..N {
         for x in 0..N {
-            let (dx, dy) = (x as f32 - c, y as f32 - c);
-            let d = (dx * dx + dy * dy).sqrt();
-            let outer = (r - d).clamp(0.0, 1.0); // 1 inside, 0 outside, AA at rim
-            let cov = if filled {
-                outer
-            } else {
-                // ring = inside the outer rim AND outside the inner rim.
-                outer.min((d - ring_inner).clamp(0.0, 1.0))
-            };
-            if cov > 0.0 {
-                let i = ((y * N + x) * 4) as usize;
-                rgba[i] = cr;
-                rgba[i + 1] = cg;
-                rgba[i + 2] = cb;
-                rgba[i + 3] = (cov * max_alpha * 255.0).round() as u8;
-            }
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let i = ((y * N + x) * 4) as usize;
+            let p = &mut rgba[i..i + 4];
+
+            let body = 0.5 - sd_round_rect(px, py, 16.0, 16.0, 13.0, 13.0, 6.0);
+            blend(p, [0x18, 0x1B, 0x20, 0xFF], body);
+
+            let rim = (0.8 - sd_round_rect(px, py, 16.0, 16.0, 13.0, 13.0, 6.0)).clamp(0.0, 1.0)
+                * (sd_round_rect(px, py, 16.0, 16.0, 10.9, 10.9, 4.7) + 0.8).clamp(0.0, 1.0);
+            blend(p, [0x35, 0x39, 0x40, 0xD8], rim);
+
+            let gt = (1.05 - line_dist(px, py, 10.2, 12.3, 13.9, 16.0)).clamp(0.0, 1.0)
+                .max((1.05 - line_dist(px, py, 13.9, 16.0, 10.2, 19.7)).clamp(0.0, 1.0));
+            blend(p, [0xFF, 0xFE, 0xF8, 0xFF], gt);
+
+            let cursor = 0.5 - sd_round_rect(px, py, 21.6, 16.0, 1.15, 3.45, 0.6);
+            blend(p, [0xFF, 0xFE, 0xF8, 0xFF], cursor);
+
+            let mouth = (0.55 - sd_round_rect(px, py, 16.0, 23.0, 3.6, 0.75, 0.2)).clamp(0.0, 1.0)
+                .max((0.55 - sd_round_rect(px, py, 12.6, 22.0, 0.9, 0.9, 0.1)).clamp(0.0, 1.0))
+                .max((0.55 - sd_round_rect(px, py, 19.4, 22.0, 0.9, 0.9, 0.1)).clamp(0.0, 1.0));
+            blend(p, [0xFF, 0xFE, 0xF8, 0xF5], mouth);
+
+            let led_dist = (px - 23.8).hypot(py - 8.3);
+            blend(p, [led[0], led[1], led[2], 0x52], (5.0 - led_dist).clamp(0.0, 1.0) * 0.55);
+            blend(p, led, (2.7 - led_dist).clamp(0.0, 1.0));
         }
     }
     tray_icon::Icon::from_rgba(rgba, N, N).expect("valid tray icon")

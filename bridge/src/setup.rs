@@ -2226,8 +2226,13 @@ pub fn install_desktop_launcher(app_exe: &str) -> Result<(String, String)> {
     };
     let contents = bundle.join("Contents");
     let macos_dir = contents.join("MacOS");
+    let resources_dir = contents.join("Resources");
     std::fs::create_dir_all(&macos_dir)?;
-    std::fs::create_dir_all(contents.join("Resources"))?;
+    std::fs::create_dir_all(&resources_dir)?;
+    write_atomic(
+        &resources_dir.join("AgentBuddy.icns"),
+        include_bytes!("../assets/app-icon.icns"),
+    )?;
 
     // Make the bundle self-contained: the GUI *and* the daemon must both live in
     // Contents/MacOS, because the GUI's Install button locates the daemon as its
@@ -2274,6 +2279,7 @@ pub fn install_desktop_launcher(app_exe: &str) -> Result<(String, String)> {
   <key>CFBundleDisplayName</key><string>Agent Buddy</string>
   <key>CFBundleIdentifier</key><string>com.nateschnell.agent-buddy-app</string>
   <key>CFBundleExecutable</key><string>agent-buddy-app</string>
+  <key>CFBundleIconFile</key><string>AgentBuddy</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleVersion</key><string>{ver}</string>
   <key>CFBundleShortVersionString</key><string>{ver}</string>
@@ -2317,6 +2323,8 @@ pub fn install_desktop_launcher(app_exe: &str) -> Result<(String, String)> {
     // No native .lnk writer in std, so drive the WScript.Shell COM object via
     // PowerShell — present on every supported Windows.
     let base = directories::BaseDirs::new().context("home dir")?;
+    let icon = crate::state::config_dir()?.join("app-icon.ico");
+    write_atomic(&icon, include_bytes!("../assets/app-icon.ico"))?;
     let programs = base
         .data_dir()
         .join(r"Microsoft\Windows\Start Menu\Programs");
@@ -2324,9 +2332,11 @@ pub fn install_desktop_launcher(app_exe: &str) -> Result<(String, String)> {
     let lnk = programs.join("Agent Buddy.lnk");
     let script = format!(
         "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{lnk}');\
-         $s.TargetPath='{exe}';$s.Description='Agent Buddy';$s.Save()",
+         $s.TargetPath='{exe}';$s.Description='Agent Buddy';\
+         $s.IconLocation='{icon},0';$s.Save()",
         lnk = lnk.display(),
         exe = app_exe,
+        icon = icon.display(),
     );
     run_cmd(
         "powershell",
@@ -2345,6 +2355,14 @@ pub fn install_desktop_launcher(app_exe: &str) -> Result<(String, String)> {
     let base = directories::BaseDirs::new().context("home dir")?;
     let dir = base.home_dir().join(".local/share/applications");
     std::fs::create_dir_all(&dir)?;
+    let icon_dir = base
+        .home_dir()
+        .join(".local/share/icons/hicolor/256x256/apps");
+    std::fs::create_dir_all(&icon_dir)?;
+    write_atomic(
+        &icon_dir.join("agent-buddy.png"),
+        include_bytes!("../assets/app-icon-256.png"),
+    )?;
     let desktop = dir.join("agent-buddy.desktop");
     let body = format!(
         "[Desktop Entry]\n\
@@ -2352,6 +2370,7 @@ pub fn install_desktop_launcher(app_exe: &str) -> Result<(String, String)> {
          Name=Agent Buddy\n\
          Comment=Control panel for your Claude hardware buddy\n\
          Exec={app_exe}\n\
+         Icon=agent-buddy\n\
          Terminal=false\n\
          Categories=Utility;\n\
          StartupNotify=true\n"

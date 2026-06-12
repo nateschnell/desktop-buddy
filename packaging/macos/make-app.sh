@@ -111,6 +111,10 @@ fi
 # travel with every copy, not only compiled into the GUI. Resolved relative to
 # this script's repo path.
 ASSETS="$(cd "$(dirname "$0")/../.." && pwd)/bridge/assets"
+if [ -f "$ASSETS/app-icon.icns" ]; then
+  cp "$ASSETS/app-icon.icns" "$CONTENTS/Resources/AgentBuddy.icns"
+  echo "    bundled AgentBuddy.icns"
+fi
 if [ -f "$ASSETS/LICENSE" ]; then
   TPL="$CONTENTS/Resources/THIRD_PARTY_LICENSES"
   {
@@ -137,6 +141,7 @@ cat > "$CONTENTS/Info.plist" <<PLIST
   <key>CFBundleDisplayName</key><string>Agent Buddy</string>
   <key>CFBundleIdentifier</key><string>com.nateschnell.agent-buddy-app</string>
   <key>CFBundleExecutable</key><string>agent-buddy-app</string>
+  <key>CFBundleIconFile</key><string>AgentBuddy</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleVersion</key><string>$SHORT</string>
   <key>CFBundleShortVersionString</key><string>$SHORT</string>

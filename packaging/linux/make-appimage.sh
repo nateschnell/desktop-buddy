@@ -101,14 +101,17 @@ Categories=Utility;
 Terminal=false
 DESKTOP
 
-# Icon: a simple generated square, or a 1x1 placeholder if ImageMagick is absent
-# (appimagetool only requires the file to exist and match the name).
-if command -v convert >/dev/null 2>&1; then
-  convert -size 256x256 xc:'#C15F3C' "$APPDIR/agent-buddy.png"
+# Icon name must match the .desktop Icon= key. Keep a root copy for AppImage
+# tooling and an hicolor copy for desktop environments that inspect the bundle.
+mkdir -p "$APPDIR/usr/share/icons/hicolor/256x256/apps"
+if [ -f "$ASSETS/app-icon-256.png" ]; then
+  cp "$ASSETS/app-icon-256.png" "$APPDIR/agent-buddy.png"
+  cp "$ASSETS/app-icon-256.png" "$APPDIR/usr/share/icons/hicolor/256x256/apps/agent-buddy.png"
 else
   base64 -d > "$APPDIR/agent-buddy.png" <<'PNG'
 iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNgYGAAAAAEAAEnNCcKAAAAAElFTkSuQmCC
 PNG
+  cp "$APPDIR/agent-buddy.png" "$APPDIR/usr/share/icons/hicolor/256x256/apps/agent-buddy.png"
 fi
 
 # AppRun: launch the GUI. The AppImage runtime exports $APPIMAGE (the path of the

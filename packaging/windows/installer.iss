@@ -10,7 +10,8 @@
 ;
 ; Compiled in CI with:
 ;   iscc /DAppVersion=<ver> /DStageDir=<dir-with-binaries+firmware> installer.iss
-; where StageDir holds agent-buddy.exe, agent-buddy-app.exe, and firmware*.*
+; where StageDir holds agent-buddy.exe, agent-buddy-app.exe, app-icon.ico, and
+; firmware*.*
 ;
 ; Signing (deferred): when an Authenticode cert exists, add SignTool here and a
 ; signing step in CI — the layout is otherwise unchanged.
@@ -21,6 +22,7 @@
 #ifndef StageDir
   #define StageDir "stage"
 #endif
+#define IconFile AddBackslash(StageDir) + "app-icon.ico"
 
 [Setup]
 AppId={{B4D8F2A1-3C7E-4E2B-9A6F-AGENTBUDDY01}
@@ -39,6 +41,9 @@ SolidCompression=yes
 WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
+#if FileExists(IconFile)
+SetupIconFile={#IconFile}
+#endif
 
 [Files]
 Source: "{#StageDir}\agent-buddy-app.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -51,14 +56,20 @@ Source: "{#StageDir}\agent-buddy-widget.exe"; DestDir: "{app}"; Flags: ignorever
 ; app's one-click OTA has an image for whichever board connects.
 Source: "{#StageDir}\firmware*.bin";        DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#StageDir}\firmware*.version";     DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#StageDir}\app-icon.ico";           DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 ; Bundled-asset license notice (Lucide/Feather icon font, ISC + MIT). Stage
 ; bridge\assets\LICENSE into StageDir as THIRD_PARTY_LICENSES alongside the
 ; binaries so the required notice ships with the install.
 Source: "{#StageDir}\THIRD_PARTY_LICENSES"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Icons]
+#if FileExists(IconFile)
+Name: "{group}\Agent Buddy";               Filename: "{app}\agent-buddy-app.exe"; IconFilename: "{app}\app-icon.ico"
+Name: "{userdesktop}\Agent Buddy";         Filename: "{app}\agent-buddy-app.exe"; IconFilename: "{app}\app-icon.ico"; Tasks: desktopicon
+#else
 Name: "{group}\Agent Buddy";               Filename: "{app}\agent-buddy-app.exe"
 Name: "{userdesktop}\Agent Buddy";         Filename: "{app}\agent-buddy-app.exe"; Tasks: desktopicon
+#endif
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"

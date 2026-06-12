@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="Agent Buddy icon">
+  <defs>
+    <linearGradient id="screen" x1="208" y1="156" x2="816" y2="868" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#20242a"/>
+      <stop offset="0.55" stop-color="#181b20"/>
+      <stop offset="1" stop-color="#121419"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="170" y1="110" x2="854" y2="914" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3d424a"/>
+      <stop offset="0.48" stop-color="#2b3037"/>
+      <stop offset="1" stop-color="#20252b"/>
+    </linearGradient>
+    <filter id="soft-shadow" x="-18%" y="-14%" width="136%" height="136%">
+      <feDropShadow dx="0" dy="22" stdDeviation="30" flood-color="#05070a" flood-opacity="0.32"/>
+    </filter>
+    <filter id="led-glow" x="-220%" y="-220%" width="540%" height="540%">
+      <feGaussianBlur stdDeviation="22" result="glow"/>
+      <feMerge>
+        <feMergeNode in="glow"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <g filter="url(#soft-shadow)">
+    <rect x="94" y="94" width="836" height="836" rx="156" fill="url(#rim)"/>
+    <rect x="132" y="132" width="760" height="760" rx="122" fill="url(#screen)"/>
+  </g>
+
+  <path
+    d="M326 394 L444 512 L326 630"
+    fill="none"
+    stroke="#fffaf2"
+    stroke-width="62"
+    stroke-linecap="round"
+    stroke-linejoin="round"/>
+
+  <rect x="654" y="402" width="72" height="220" rx="19" fill="#fffaf2"/>
+
+  <g fill="#fffaf2">
+    <rect x="421" y="672" width="34" height="34"/>
+    <rect x="455" y="706" width="138" height="28"/>
+    <rect x="593" y="672" width="34" height="34"/>
+  </g>
+
+  <g filter="url(#led-glow)">
+    <circle cx="786" cy="232" r="35" fill="#15e0d2"/>
+  </g>
+</svg>

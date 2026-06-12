@@ -60,11 +60,14 @@ ship together with a release for the verification above to succeed.
    public release, and stage them next to the binaries for bundling (so the
    bundled/offline path has them too).
 
-3. **Stage `THIRD_PARTY_LICENSES` for the Windows installer.** `make-app.sh` and
-   `make-appimage.sh` already assemble it from `bridge/assets/LICENSE` +
-   `bridge/assets/IBMPlexSans-LICENSE.txt`; the Inno Setup build (`installer.iss`,
-   `[Files]`) expects a `THIRD_PARTY_LICENSES` in its `StageDir`. Concatenate the
-   same two files into `StageDir/THIRD_PARTY_LICENSES` before `iscc`.
+3. **Stage Windows installer assets.** `make-app.sh` and `make-appimage.sh`
+   already assemble the bundled notices from `bridge/assets/LICENSE` +
+   `bridge/assets/IBMPlexSans-LICENSE.txt`; the Inno Setup build
+   (`installer.iss`, `[Files]`) expects a `THIRD_PARTY_LICENSES` in its
+   `StageDir`. Concatenate the same two files into `StageDir/THIRD_PARTY_LICENSES`
+   before `iscc`. Also copy `bridge/assets/app-icon.ico` to
+   `StageDir/app-icon.ico` so the installer, Start Menu shortcut, and optional
+   desktop shortcut use the Agent Buddy icon.
 
 ---
 
