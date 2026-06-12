@@ -200,6 +200,7 @@ jobs:
           Copy-Item target/${{ matrix.target }}/release/agent-buddy.exe bin/
           Copy-Item target/${{ matrix.target }}/release/agent-buddy-app.exe bin/
           Copy-Item target/${{ matrix.target }}/release/agent-buddy-widget.exe bin/
+          if (Test-Path assets/app-icon.ico) { Copy-Item assets/app-icon.ico bin/ }
 
       - name: Upload raw binaries
         uses: actions/upload-artifact@v5
