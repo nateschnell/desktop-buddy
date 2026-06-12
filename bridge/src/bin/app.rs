@@ -39,7 +39,6 @@ mod ic {
     pub const MOON: &str = "\u{E11E}";
     pub const CHECK: &str = "\u{E06C}";
     pub const CROSS: &str = "\u{E1B2}"; // x
-    pub const STAR: &str = "\u{E412}"; // sparkles — the brand mark
 }
 
 /// License notices for the fonts bundled *into* this binary: the Lucide icon
@@ -70,6 +69,19 @@ fn app_icon() -> Option<egui::IconData> {
         width,
         height,
     })
+}
+
+fn app_icon_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let image = image::load_from_memory(include_bytes!("../../assets/app-icon.png"))
+        .ok()?
+        .into_rgba8();
+    let size = [image.width() as usize, image.height() as usize];
+    let rgba = image.into_raw();
+    Some(ctx.load_texture(
+        "agent-buddy-app-icon",
+        egui::ColorImage::from_rgba_unmultiplied(size, &rgba),
+        egui::TextureOptions::LINEAR,
+    ))
 }
 
 /// The family carrying the bundled SemiBold weight. egui has no synthetic bold —
@@ -552,6 +564,8 @@ struct App {
     /// When we last asked the daemon to re-poll for updates — throttles the
     /// focus-driven recheck so rapid focus flapping can't hammer GitHub.
     last_update_recheck: Option<Instant>,
+    /// The prompt-face app icon used in the sidebar brand lockup.
+    brand_icon: Option<egui::TextureHandle>,
     /// The connection state the tray icon currently shows — so we only redraw the
     /// menu-bar glyph when it actually changes, not every frame. Unused on Linux,
     /// which has no tray.
@@ -612,6 +626,7 @@ impl App {
         // Install the bundled icon font before anything paints, or the first
         // frames render every icon as a missing-glyph box.
         install_fonts(&cc.egui_ctx);
+        let brand_icon = app_icon_texture(&cc.egui_ctx);
         let (tx, rx_cmd) = std::sync::mpsc::channel::<Cmd>();
         let (tx_msg, rx) = std::sync::mpsc::channel::<Msg>();
         spawn_worker(cc.egui_ctx.clone(), rx_cmd, tx_msg);
@@ -653,6 +668,7 @@ impl App {
             pending_uninstall: false,
             was_focused: true,
             last_update_recheck: Some(Instant::now()),
+            brand_icon,
             tray_state: TrayState::Off,
             widget_proc,
             widget_enabled,
@@ -882,20 +898,22 @@ impl App {
                     .inner_margin(egui::Margin::symmetric(14.0, 18.0)),
             )
             .show(ctx, |ui| {
-                // Brand lockup: a teal mark drawn in code (no asset to ship) + the
-                // wordmark.
+                // Brand lockup: the same prompt-face mark used by the OS icon +
+                // the wordmark.
                 ui.horizontal(|ui| {
                     let (rect, _) =
                         ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
-                    ui.painter()
-                        .rect_filled(rect, egui::Rounding::same(radius::NAV), p.accent);
-                    ui.painter().text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        ic::STAR,
-                        icon_font(15.0),
-                        p.on_accent,
-                    );
+                    if let Some(icon) = &self.brand_icon {
+                        ui.painter().image(
+                            icon.id(),
+                            rect,
+                            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    } else {
+                        ui.painter()
+                            .rect_filled(rect, egui::Rounding::same(radius::NAV), p.accent);
+                    }
                     ui.add_space(9.0);
                     ui.vertical(|ui| {
                         ui.add_space(2.0);
